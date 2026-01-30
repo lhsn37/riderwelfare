@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-requests
 python-multipart
 python-dateutil
 itsdangerous

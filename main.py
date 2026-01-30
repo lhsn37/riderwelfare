@@ -1,21 +1,16 @@
-# main.py (Render 경량화 버전: Playwright 제거 / requests 사용)
+# main.py (Render 조회용: PC Collector가 업로드한 데이터만 사용)
 # ------------------------------------------------------------------------------------
-# 변경사항(요청 반영)
-# 1) 계약종료 라이더 제외: accountStatus.code 가 종료 계열이면 목록/조회/대시보드에서 제외
-# 2) 로그인용 "가상 뒷4" 지원:
-#    - 관리자가 대시보드에서 가상 뒷4 지정/변경 가능
-#    - 개인 조회(/check)는 "이름 + 가상 뒷4"로만 로그인/조회
-# 3) 개인정보 최소노출: 개인 결과 화면은 마스킹 전화번호 유지
-# 4) Render 경량화: Playwright 제거(브라우저 설치 불필요), requests + BAEMIN_COOKIE 사용
-# 5) 세션만료(쿠키 오류) 시 500 대신 안내 페이지로 처리
+# 구조
+# - PC(collector.py): 배민 API 호출(쿠키/센터ID는 PC에만) → Render로 업로드
+# - Render(main.py): 업로드된 riders/status JSON만 읽어서 /check /dashboard 제공
 #
-# 설치:
-#   pip install -r requirements.txt
+# Render 환경변수(필수)
+# - INGEST_TOKEN : 업로드 인증 토큰(긴 문자열)
+# - SESSION_SECRET : (선택) 관리자 세션키
+# - ADMIN_PASSWORD : (선택) 관리자 비번(기본 0315)
+# - STORE_DIR : (선택) 저장 폴더(기본 현재 디렉토리). Render Disk 붙이면 그 경로로 지정 추천.
 #
-# 로컬 실행:
-#   set BAEMIN_CENTER_ID=DP2510205467
-#   set BAEMIN_COOKIE=... (쿠키 문자열)
-#   uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# ⚠️ Render에는 BAEMIN_COOKIE, BAEMIN_CENTER_ID 필요 없음(지워도 됨)
 # ------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,46 +21,51 @@ import re
 import threading
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
-
 
 # -----------------------------
 # Config
 # -----------------------------
-BASE_API = "https://api-deliverycenter.baemin.com"
-
-RIDERS_CACHE_TTL = 60
-STATUS_CACHE_TTL = 30
+RIDERS_CACHE_TTL = 10  # 업로드 파일 읽기 캐시(초)
+STATUS_CACHE_TTL = 10
 
 RATE_WINDOW_SEC = 60
 RATE_MAX_REQ = 30
 
-# Render에서는 환경변수로 바꾸는 걸 권장
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "0315")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "rider-welfare-admin-secret")
+INGEST_TOKEN = (os.getenv("INGEST_TOKEN") or "").strip()
 
 OVERRIDE_FILE = "join_overrides.json"     # key: "normname|login4" -> "YYYY-MM-DD"
-LOGIN4_FILE = "login4_overrides.json"     # key: "normname|real4"  -> "login4"  (가상뒷4)
+LOGIN4_FILE = "login4_overrides.json"     # key: "normname|real4"  -> "login4"
 
 _override_lock = threading.Lock()
 _login4_lock = threading.Lock()
 
 _rate_bucket: Dict[str, List[float]] = {}
-_riders_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
-_status_cache: Dict[str, Any] = {}
 
-app = FastAPI(title="라웰 등급 조회 (Requests)")
+# 저장 위치
+STORE_DIR = Path(os.getenv("STORE_DIR", "."))
+STORE_DIR.mkdir(parents=True, exist_ok=True)
+RIDERS_STORE = STORE_DIR / "store_riders.json"
+STATUS_STORE = STORE_DIR / "store_status.json"
+
+# 메모리 캐시
+_riders_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_status_cache: Dict[str, Any] = {}  # key: "from_to" -> {"ts":..., "data":...}
+
+app = FastAPI(title="라웰 등급 조회 (Collector Ingest)")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 
 
 # -----------------------------
-# Helpers
+# HTML helpers
 # -----------------------------
 def html_page(title: str, body: str) -> str:
     return f"""<!doctype html>
@@ -75,7 +75,7 @@ def html_page(title: str, body: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{title}</title>
 </head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding:16px; background:#fafafa;">
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; padding:16px; background:#fafafa;">
   <div style="max-width:1200px; margin:0 auto;">
     {body}
   </div>
@@ -281,177 +281,98 @@ def get_effective_join_date_by_login_key(rider: Dict[str, Any], login4: str) -> 
 
     created_raw = rider.get("createdDate")
     if isinstance(created_raw, str) and len(created_raw) >= 10:
-        return date.fromisoformat(created_raw[:10]), "createdDate"
+        try:
+            return date.fromisoformat(created_raw[:10]), "createdDate"
+        except Exception:
+            pass
 
     return date.today(), "fallback"
 
 
 # -----------------------------
-# Render 환경변수
+# Store helpers
 # -----------------------------
-def require_center_id() -> str:
-    center_id = (os.getenv("BAEMIN_CENTER_ID") or "").strip()
-    if not center_id:
-        raise RuntimeError("BAEMIN_CENTER_ID가 없습니다. Render Settings > Environment에 추가하세요.")
-    return center_id
-
-
-def require_cookie() -> str:
-    cookie = (os.getenv("BAEMIN_COOKIE") or "").strip()
-    if not cookie:
-        raise RuntimeError("BAEMIN_COOKIE가 없습니다. Render Settings > Environment에 추가하세요.")
-    return cookie
-
-
-# -----------------------------
-# HTTP (requests)
-# -----------------------------
-_session = requests.Session()
-_session.headers.update({
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0",
-    "Origin": "https://deliverycenter.baemin.com",
-    "Referer": "https://deliverycenter.baemin.com/",
-})
-
-
-import os
-import requests
-
-BASE_API = "https://api-deliverycenter.baemin.com"
-
-def _clean_cookie(raw: str) -> str:
-    # Render 환경변수 textarea에서 줄바꿈/공백이 섞이면 헤더가 깨질 수 있어서 정리
-    if not raw:
-        return ""
-    return raw.replace("\r", " ").replace("\n", " ").strip()
-
-def _build_headers() -> dict:
-    center_id = (os.getenv("BAEMIN_CENTER_ID") or "").strip()
-    cookie = _clean_cookie(os.getenv("BAEMIN_COOKIE") or "")
-
-    if not center_id or not cookie:
-        raise PermissionError("SESSION_EXPIRED")
-
-    return {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "accept-encoding": "gzip, deflate, br",
-        "origin": "https://deliverycenter.baemin.com",
-        "referer": "https://deliverycenter.baemin.com/",
-        "user-agent": os.getenv(
-            "BAEMIN_UA",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        ),
-        "center-id": center_id,
-        "cookie": cookie,
-    }
-
-
-def api_get(url: str, params: dict | None = None):
-    headers = _build_headers()
-
-    # 세션 유지/재사용(가끔 클라우드플레어가 세션/쿠키에 민감)
-    with requests.Session() as s:
-        r = s.get(url, params=params, headers=headers, timeout=20)
-        print("API_GET", url, "status=", r.status_code, "len=", len(r.text))
-        print("API_BODY_HEAD", r.text[:200])
-
-
-    # ✅ 여기! requests는 status가 아니라 status_code
-    if r.status_code in (401, 403):
-        raise PermissionError("SESSION_EXPIRED")
-
-    if r.status_code >= 400:
-        # 디버깅용: 앞부분만
-        raise RuntimeError(f"API_HTTP_{r.status_code}: {r.text[:200]}")
-
-    # JSON 파싱
+def _read_json(path: Path, default):
     try:
-        return r.json()
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        raise RuntimeError(f"API_NON_JSON: {r.text[:200]}")
+        return default
 
+
+def _write_json(path: Path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _require_ingest(request: Request):
+    token = request.headers.get("x-ingest-token", "")
+    if not INGEST_TOKEN or token != INGEST_TOKEN:
+        return JSONResponse({"ok": False, "error": "UNAUTHORIZED"}, status_code=401)
+    return None
 
 
 # -----------------------------
-# Baemin API wrappers (cached)
+# Data access (Render는 업로드된 것만 읽음)
 # -----------------------------
 def fetch_riders_cached() -> List[Dict[str, Any]]:
     now = time.time()
     if _riders_cache["data"] is not None and now - _riders_cache["ts"] <= RIDERS_CACHE_TTL:
         return _riders_cache["data"]
 
-    params = {
-        "name": "",
-        "userId": "",
-        "phoneNumber": "",
-        "accountStatus": "",
-        "orderName": "",
-        "orderBy": "",
-    }
-
-    j = api_get(f"{BASE_API}/rider", params=params)
-
-    if isinstance(j, list):
-        items = j
-    elif isinstance(j, dict):
-        items = j.get("items") or j.get("data") or []
-    else:
-        items = []
-
-    items = [r for r in items if not is_ended_contract(r)]
+    store = _read_json(RIDERS_STORE, {"riders": []})
+    riders = store.get("riders") or []
+    if not isinstance(riders, list):
+        riders = []
+    riders = [r for r in riders if isinstance(r, dict)]
+    riders = [r for r in riders if not is_ended_contract(r)]
 
     _riders_cache["ts"] = now
-    _riders_cache["data"] = items
-    return items
+    _riders_cache["data"] = riders
+    return riders
 
 
 def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
-    today = date.today()
-    if to_d >= today:
-        to_d = today - timedelta(days=1)
-    if from_d > to_d:
-        from_d = to_d
-
-    key_cache = f"{from_d.isoformat()}_{to_d.isoformat()}"
+    key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     now = time.time()
-    cached = _status_cache.get(key_cache)
+    cached = _status_cache.get(key)
     if cached and now - cached["ts"] <= STATUS_CACHE_TTL:
         return cached["data"]
 
-    complete: Dict[str, int] = {}
-    size = 100
-    page = 0
-    max_pages = 600
+    all_status = _read_json(STATUS_STORE, {})
+    m = all_status.get(key) or {}
+    out: Dict[str, int] = {}
+    if isinstance(m, dict):
+        for k, v in m.items():
+            try:
+                out[str(k)] = int(v)
+            except Exception:
+                pass
 
-    while page < max_pages:
-        params = {
-            "page": page,
-            "size": size,
-            "fromDate": from_d.isoformat(),
-            "toDate": to_d.isoformat(),
-        }
+    _status_cache[key] = {"ts": now, "data": out}
+    return out
 
-        j = api_get(f"{BASE_API}/management/rider-delivery-status", params=params)
 
-        rows = (j.get("data") or []) if isinstance(j, dict) else []
-        if not rows:
-            break
+def store_ready() -> bool:
+    st = _read_json(RIDERS_STORE, {})
+    riders = st.get("riders") if isinstance(st, dict) else None
+    return isinstance(riders, list) and len(riders) > 0
 
-        for it in rows:
-            nm = it.get("name") or ""
-            ph = it.get("phoneNumber") or ""
-            real4 = last4_from_phone(ph)
-            k = f"{norm_name(nm)}|{real4}"
-            cnt = (it.get("deliveryAcceptanceCount") or {}).get("complete") or 0
-            if k and real4:
-                complete[k] = int(cnt)
 
-        page += 1
-
-    _status_cache[key_cache] = {"ts": now, "data": complete}
-    return complete
+def not_ready_page() -> HTMLResponse:
+    body = """
+    <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:720px;margin:0 auto;">
+      <h3 style="margin-top:0;">아직 데이터가 없습니다</h3>
+      <div style="color:#666;line-height:1.6;">
+        Render는 배민 API를 직접 호출하지 않습니다.<br/>
+        PC에서 collector.py를 실행해서 <b>/ingest</b>로 데이터를 먼저 업로드해야 조회가 됩니다.
+      </div>
+      <div style="margin-top:12px;">
+        <a href="/health" style="text-decoration:none;color:#111;">Health 보기</a>
+      </div>
+    </div>
+    """
+    return HTMLResponse(html_page("데이터 없음", body), status_code=200)
 
 
 # -----------------------------
@@ -463,23 +384,86 @@ def require_admin(request: Request) -> Optional[RedirectResponse]:
     return None
 
 
-def session_expired_page() -> HTMLResponse:
-    body = """
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:640px; margin:0 auto;">
-      <h3 style="margin-top:0;">세션(쿠키) 만료 또는 설정 오류</h3>
-      <div style="color:#666; line-height:1.6;">
-        현재 서버가 배민 API에 접근할 쿠키(BAEMIN_COOKIE)가 없거나 만료되었습니다.<br/>
-        <b>Render → Settings → Environment</b>에서<br/>
-        <b>BAEMIN_CENTER_ID</b>, <b>BAEMIN_COOKIE</b> 를 다시 설정 후 재배포하세요.
-      </div>
-      <div style="margin-top:12px;">
-        <a href="/" style="text-decoration:none; color:#111;">← 홈</a>
-        &nbsp;&nbsp;
-        <a href="/health" style="text-decoration:none; color:#666;">헬스체크</a>
-      </div>
-    </div>
-    """
-    return HTMLResponse(html_page("세션 만료", body), status_code=200)
+# -----------------------------
+# Ingest endpoints (PC Collector 전용)
+# -----------------------------
+@app.post("/ingest/riders")
+async def ingest_riders(request: Request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    payload = await request.json()
+    riders = payload.get("riders")
+    if not isinstance(riders, list):
+        return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
+
+    _write_json(RIDERS_STORE, {"ts": time.time(), "riders": riders})
+    _riders_cache["ts"] = 0.0
+    _riders_cache["data"] = None
+    return {"ok": True, "count": len(riders)}
+
+
+@app.get("/ingest/ranges")
+def ingest_ranges(request: Request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    store = _read_json(RIDERS_STORE, {"riders": []})
+    riders = store.get("riders") or []
+    if not isinstance(riders, list) or not riders:
+        return {"ok": False, "error": "NO_RIDERS"}
+
+    today = date.today()
+    ranges = set()
+
+    for rr in riders:
+        if not isinstance(rr, dict):
+            continue
+        ph = rr.get("phoneNumber") or ""
+        real4 = last4_from_phone(ph)
+        if not real4:
+            continue
+
+        login4, _, _ = get_login4_for_rider(rr)
+        eff_join, _ = get_effective_join_date_by_login_key(rr, login4)
+
+        cur_start, cur_end_incl = current_period(eff_join, today)
+        cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
+
+        prev_end_incl = cur_start - timedelta(days=1)
+        prev_start = cur_start - relativedelta(months=1)
+        prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
+
+        ranges.add((cur_from.isoformat(), cur_to.isoformat()))
+        ranges.add((prev_from.isoformat(), prev_to.isoformat()))
+
+    out = [{"fromDate": a, "toDate": b} for (a, b) in sorted(ranges)]
+    return {"ok": True, "ranges": out, "count": len(out)}
+
+
+@app.post("/ingest/status")
+async def ingest_status(request: Request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    payload = await request.json()
+    from_d = payload.get("fromDate")
+    to_d = payload.get("toDate")
+    complete_map = payload.get("completeMap")
+
+    if not (isinstance(from_d, str) and isinstance(to_d, str) and isinstance(complete_map, dict)):
+        return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
+
+    all_status = _read_json(STATUS_STORE, {})
+    key = f"{from_d}_{to_d}"
+    all_status[key] = complete_map
+    _write_json(STATUS_STORE, all_status)
+
+    _status_cache.pop(key, None)
+    return {"ok": True, "key": key, "count": len(complete_map)}
 
 
 # -----------------------------
@@ -487,6 +471,9 @@ def session_expired_page() -> HTMLResponse:
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
+    if not store_ready():
+        return not_ready_page()
+
     body = """
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:520px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">라웰 등급 조회</h2>
@@ -537,12 +524,13 @@ def admin_help():
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:720px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">관리자</h2>
       <div style="color:#666; margin-bottom:12px;">
-        Render에서 <b>BAEMIN_COOKIE</b>가 만료되면 다시 갱신해서 환경변수에 넣어야 합니다.
+        이 서버(Render)는 배민 API를 직접 호출하지 않습니다.<br/>
+        PC에서 collector.py가 /ingest 로 데이터를 업로드하면 조회가 됩니다.
       </div>
 
       <div style="background:#f7f7f7; border-radius:12px; padding:12px; font-size:14px; line-height:1.5;">
         <div><b>Render 설정</b></div>
-        <div>- Settings → Environment → BAEMIN_CENTER_ID / BAEMIN_COOKIE 등록</div>
+        <div>- Settings → Environment → <b>INGEST_TOKEN</b> 등록</div>
         <div>- Start Command: <span style="font-family: ui-monospace;">uvicorn main:app --host 0.0.0.0 --port $PORT</span></div>
       </div>
 
@@ -556,6 +544,9 @@ def admin_help():
 
 @app.post("/check", response_class=HTMLResponse)
 def check(request: Request, name: str = Form(...), login4: str = Form(...)):
+    if not store_ready():
+        return not_ready_page()
+
     ip = request.client.host if request.client else "unknown"
     if not rate_limit(ip):
         body = """
@@ -580,12 +571,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
         """
         return html_page("입력 오류", body)
 
-    try:
-        riders = fetch_riders_cached()
-    except PermissionError:
-        return session_expired_page()
-    except RuntimeError:
-        return session_expired_page()
+    riders = fetch_riders_cached()
 
     candidates = [r for r in riders if norm_name(r.get("name", "")) == name_in]
     matches: List[Dict[str, Any]] = []
@@ -617,7 +603,6 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
 
     rider = matches[0]
     rider_login4, rider_real4, login_src = get_login4_for_rider(rider)
-
     eff_join_date, join_src = get_effective_join_date_by_login_key(rider, rider_login4)
 
     today = date.today()
@@ -629,13 +614,8 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     prev_start = cur_start - relativedelta(months=1)
     prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
-    try:
-        cmap_cur = fetch_status_complete_map_cached(cur_from, cur_to)
-        cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
-    except PermissionError:
-        return session_expired_page()
-    except RuntimeError:
-        return session_expired_page()
+    cmap_cur = fetch_status_complete_map_cached(cur_from, cur_to)
+    cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
 
     api_key = f"{name_in}|{rider_real4}"
     cur_completed = int(cmap_cur.get(api_key, 0))
@@ -666,7 +646,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
           <div style="font-size:32px; font-weight:900; line-height:1.1;">{current_grade}</div>
           <div style="font-size:12px; color:#999; margin-top:6px;">
             정책기간: {prev_start} ~ {prev_end_incl}<br/>
-            반영기간(API): {prev_from} ~ {prev_to} / 완료 {prev_completed}건
+            반영기간(업로드): {prev_from} ~ {prev_to} / 완료 {prev_completed}건
           </div>
         </div>
 
@@ -675,7 +655,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
           <div style="font-size:32px; font-weight:900; line-height:1.1;">{planned_grade}</div>
           <div style="font-size:12px; color:#999; margin-top:6px;">
             정책기간: {cur_start} ~ {cur_end_incl}<br/>
-            반영기간(API): {cur_from} ~ {cur_to} / 완료 {cur_completed}건
+            반영기간(업로드): {cur_from} ~ {cur_to} / 완료 {cur_completed}건
           </div>
         </div>
       </div>
@@ -818,15 +798,11 @@ def dashboard(request: Request, q: str = ""):
     if r:
         return r
 
-    try:
-        riders = fetch_riders_cached()
-    except PermissionError:
-        return session_expired_page()
-    except RuntimeError:
-        return session_expired_page()
+    if not store_ready():
+        return not_ready_page()
 
+    riders = fetch_riders_cached()
     join_overrides = load_overrides()
-
     qn = norm_name(q)
 
     rider_rows = []
@@ -890,69 +866,63 @@ def dashboard(request: Request, q: str = ""):
         prev_group.setdefault((prev_from, prev_to), []).append(item)
         computed_rows.append(item)
 
-    try:
-        prev_completed_map: Dict[str, int] = {}
-        for (from_d, to_d), items in prev_group.items():
-            cmap = fetch_status_complete_map_cached(from_d, to_d)
-            for it in items:
-                prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
+    prev_completed_map: Dict[str, int] = {}
+    for (from_d, to_d), items in prev_group.items():
+        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        for it in items:
+            prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
 
-        final_rows = []
-        for (from_d, to_d), items in cur_group.items():
-            cmap = fetch_status_complete_map_cached(from_d, to_d)
-            for it in items:
-                rr = it["rider"]
-                nm = rr.get("name") or ""
-                created_raw = rr.get("createdDate")
-                created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
+    final_rows = []
+    for (from_d, to_d), items in cur_group.items():
+        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        for it in items:
+            rr = it["rider"]
+            nm = rr.get("name") or ""
+            created_raw = rr.get("createdDate")
+            created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
 
-                cur_completed = int(cmap.get(it["real_key"], 0))
-                prev_completed = int(prev_completed_map.get(it["real_key"], 0))
+            cur_completed = int(cmap.get(it["real_key"], 0))
+            prev_completed = int(prev_completed_map.get(it["real_key"], 0))
 
-                planned_grade = grade_from_total(cur_completed)
-                current_grade = grade_from_total(prev_completed)
-                nxt, remain = next_grade_target(cur_completed)
+            planned_grade = grade_from_total(cur_completed)
+            current_grade = grade_from_total(prev_completed)
+            nxt, remain = next_grade_target(cur_completed)
 
-                ov = join_overrides.get(it["login_key"])
-                join_default_val = ov if ov else it["eff_join"].isoformat()
+            ov = join_overrides.get(it["login_key"])
+            join_default_val = ov if ov else it["eff_join"].isoformat()
 
-                login_badge = "가상뒷4" if it["login_src"] == "override" else "실제뒷4"
-                login_badge_color = "#111" if it["login_src"] == "override" else "#888"
+            login_badge = "가상뒷4" if it["login_src"] == "override" else "실제뒷4"
+            login_badge_color = "#111" if it["login_src"] == "override" else "#888"
 
-                join_badge = "관리자설정" if it["join_src"] == "override" else "배민입사"
-                join_badge_color = "#111" if it["join_src"] == "override" else "#888"
+            join_badge = "관리자설정" if it["join_src"] == "override" else "배민입사"
+            join_badge_color = "#111" if it["join_src"] == "override" else "#888"
 
-                final_rows.append({
-                    "name": nm,
-                    "created": created_d,
-                    "real4": it["real4"],
-                    "login4": it["login4"],
-                    "login_badge": login_badge,
-                    "login_badge_color": login_badge_color,
-                    "join_effective": it["eff_join"].isoformat(),
-                    "join_badge": join_badge,
-                    "join_badge_color": join_badge_color,
-                    "join_default_val": join_default_val,
-                    "policy_from": it["cur_start"].isoformat(),
-                    "policy_to": it["cur_end_incl"].isoformat(),
-                    "api_from": it["cur_from"].isoformat(),
-                    "api_to": it["cur_to"].isoformat(),
-                    "cur_completed": cur_completed,
-                    "prev_completed": prev_completed,
-                    "current_grade": current_grade,
-                    "planned_grade": planned_grade,
-                    "next": nxt or "-",
-                    "remain": remain if remain is not None else "-",
-                    "login_key": it["login_key"],
-                    "name_norm": it["nn"],
-                })
+            final_rows.append({
+                "name": nm,
+                "created": created_d,
+                "real4": it["real4"],
+                "login4": it["login4"],
+                "login_badge": login_badge,
+                "login_badge_color": login_badge_color,
+                "join_effective": it["eff_join"].isoformat(),
+                "join_badge": join_badge,
+                "join_badge_color": join_badge_color,
+                "join_default_val": join_default_val,
+                "policy_from": it["cur_start"].isoformat(),
+                "policy_to": it["cur_end_incl"].isoformat(),
+                "api_from": it["cur_from"].isoformat(),
+                "api_to": it["cur_to"].isoformat(),
+                "cur_completed": cur_completed,
+                "prev_completed": prev_completed,
+                "current_grade": current_grade,
+                "planned_grade": planned_grade,
+                "next": nxt or "-",
+                "remain": remain if remain is not None else "-",
+                "login_key": it["login_key"],
+                "name_norm": it["nn"],
+            })
 
-        final_rows.sort(key=lambda x: x["cur_completed"], reverse=True)
-
-    except PermissionError:
-        return session_expired_page()
-    except RuntimeError:
-        return session_expired_page()
+    final_rows.sort(key=lambda x: x["cur_completed"], reverse=True)
 
     tr_html = ""
     for i, it in enumerate(final_rows, start=1):
@@ -1018,7 +988,7 @@ def dashboard(request: Request, q: str = ""):
 
           <td style="padding:10px; border-bottom:1px solid #eee; color:#666;">
             <div style="font-weight:700;">정책: {it['policy_from']} ~ {it['policy_to']}</div>
-            <div style="font-size:12px; color:#999; margin-top:4px;">API반영: {it['api_from']} ~ {it['api_to']}</div>
+            <div style="font-size:12px; color:#999; margin-top:4px;">업로드 반영: {it['api_from']} ~ {it['api_to']}</div>
           </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; font-weight:900;">{it['cur_completed']}</td>
@@ -1048,7 +1018,7 @@ def dashboard(request: Request, q: str = ""):
             - <b>다음등급/남은건수</b> = 예정등급 기준
           </div>
           <div style="color:#888; font-size:13px; margin-top:6px;">
-            * 완료건수는 ‘어제까지’ 확정치입니다.
+            * 완료건수는 ‘어제까지’ 확정치 기준(업로드 데이터).
           </div>
         </div>
 
@@ -1100,58 +1070,19 @@ def dashboard(request: Request, q: str = ""):
 # -----------------------------
 @app.get("/health", response_class=HTMLResponse)
 def health():
-    ok_cookie = bool((os.getenv("BAEMIN_COOKIE") or "").strip())
-    ok_center = bool((os.getenv("BAEMIN_CENTER_ID") or "").strip())
+    ok_token = bool(INGEST_TOKEN)
+    riders_ok = store_ready()
+    riders_ts = _read_json(RIDERS_STORE, {}).get("ts")
+    status_keys = list((_read_json(STATUS_STORE, {}) or {}).keys())[:5]
 
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:520px; margin:0 auto;">
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:720px; margin:0 auto;">
       <h3 style="margin-top:0;">Health</h3>
-      <div>cookie_env_set: <b>{ok_cookie}</b></div>
-      <div>center_id_env_set: <b>{ok_center}</b></div>
+      <div>ingest_token_set: <b>{ok_token}</b></div>
+      <div>riders_uploaded: <b>{riders_ok}</b></div>
+      <div>riders_ts: <b>{riders_ts}</b></div>
+      <div style="margin-top:8px;">status_keys(sample): <b>{status_keys}</b></div>
       <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 홈</a></div>
     </div>
     """
     return html_page("Health", body)
-
-from fastapi.responses import JSONResponse
-
-@app.get("/debug-api")
-def debug_api():
-    # 1) 헤더 구성 확인
-    try:
-        headers = _build_headers()
-    except Exception as e:
-        return JSONResponse({"ok": False, "stage": "build_headers", "error": str(e)})
-
-    # 2) 실제 요청 (api_get 말고 requests로 직접 때려서 상태/본문 확인)
-    url = f"{BASE_API}/rider"
-    params = {
-        "name": "",
-        "userId": "",
-        "phoneNumber": "",
-        "accountStatus": "",
-        "orderName": "",
-        "orderBy": "",
-    }
-
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
-        ct = r.headers.get("content-type", "")
-        body_head = (r.text or "")[:800]
-
-        # ⚠️ 쿠키 전체는 절대 반환하지 말고, 존재 여부/길이만
-        cookie_val = headers.get("cookie", "") or ""
-
-        return JSONResponse({
-            "ok": True,
-            "status_code": r.status_code,
-            "content_type": ct,
-            "resp_head": body_head,
-            "cookie_len": len(cookie_val),
-            "has_CENTER_SESSION": "CENTER_SESSION=" in cookie_val,
-            "has_cf_bm": "__cf_bm=" in cookie_val,
-            "has_cf_clearance": "cf_clearance=" in cookie_val,
-        })
-    except Exception as e:
-        return JSONResponse({"ok": False, "stage": "request", "error": repr(e)})
-
