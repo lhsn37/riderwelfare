@@ -353,6 +353,9 @@ def api_get(url: str, params: dict | None = None):
     # 세션 유지/재사용(가끔 클라우드플레어가 세션/쿠키에 민감)
     with requests.Session() as s:
         r = s.get(url, params=params, headers=headers, timeout=20)
+        print("API_GET", url, "status=", r.status_code, "len=", len(r.text))
+        print("API_BODY_HEAD", r.text[:200])
+
 
     # ✅ 여기! requests는 status가 아니라 status_code
     if r.status_code in (401, 403):
@@ -1108,3 +1111,19 @@ def health():
     </div>
     """
     return html_page("Health", body)
+
+from fastapi.responses import PlainTextResponse
+
+@app.get("/debug-api", response_class=PlainTextResponse)
+def debug_api():
+    try:
+        j = api_get(f"{BASE_API}/rider", params={
+            "name": "", "userId": "", "phoneNumber": "",
+            "accountStatus": "", "orderName": "", "orderBy": ""
+        })
+        t = str(type(j))
+        head = (json.dumps(j, ensure_ascii=False)[:500] if isinstance(j, (dict, list)) else str(j)[:500])
+        return f"OK type={t}\nHEAD={head}\n"
+    except Exception as e:
+        # api_get에서 raise 된 메시지 그대로 보여주기
+        return f"ERR {type(e).__name__}: {e}\n"
