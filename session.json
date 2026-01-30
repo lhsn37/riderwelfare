@@ -1,0 +1,122 @@
+[
+  {
+    "name": "__cf_bm",
+    "value": "Xr1zHm58iHHViRLVDwSK2pMzoSd0es966n7fjuqsUzA-1769744825-1.0.1.1-0NfZnEugpOGi6uYDeO624ZIcqTVm8zCV99w41UgHMqjMiriSbDYvwxmy69yqDxkUV03G6OIGAxNnbe6LonkcYJKx7tesV6UWzeJ_LX33UOq8.wY1f8bVZtU8ZNJ5hWV1",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1769746625.819048,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "dsid",
+    "value": "e3af85ad-8b74-445e-bd52-33bebe8d18f9",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1801280825.857155,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "cookie30d",
+    "value": "",
+    "domain": "biz-member.baemin.com",
+    "path": "/",
+    "expires": 1772336826,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "_ga",
+    "value": "GA1.3.1142978884.1769744826",
+    "domain": ".biz-member.baemin.com",
+    "path": "/",
+    "expires": 1804304826.152762,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "_gid",
+    "value": "GA1.3.999065309.1769744826",
+    "domain": ".biz-member.baemin.com",
+    "path": "/",
+    "expires": 1769831226,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "bm_session_id",
+    "value": "e3af85ad-8b74-445e-bd52-33bebe8d18f9/1769744826233",
+    "domain": "biz-member.baemin.com",
+    "path": "/",
+    "expires": 1769746633,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "_wp_uid",
+    "value": "1-1893b579c613353b97c75739f3408aa7-s1769744826.293746|windows_10|chrome-k5b8e4",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1801280833,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "userId",
+    "value": "riderwelfare",
+    "domain": "biz-member.baemin.com",
+    "path": "/",
+    "expires": 1770349633,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "_ceo_v2_gk_sid",
+    "value": "28fdc1c9-affd-4e67-a57e-6e5f97d849d7",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1801280833.257679,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "_ga",
+    "value": "GA1.1.1291915407.1769744834",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1804304833.775071,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "CENTER_SESSION",
+    "value": "MmI2OWI0OGUtN2Q5OS00NmNmLTg3ZDMtZjc5MzhlZDBiM2Zh",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "_ga_ZGDXE0V87X",
+    "value": "GS2.1.s1769744833$o1$g1$t1769744846$j47$l0$h0",
+    "domain": ".baemin.com",
+    "path": "/",
+    "expires": 1804304846.069215,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  }
+]
