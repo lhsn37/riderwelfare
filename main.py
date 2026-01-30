@@ -326,9 +326,9 @@ def api_get(url: str, params: dict | None = None) -> Any:
 
     r = _session.get(url, params=params, headers=headers, timeout=20)
 
-    if r.status in (401, 403):
+    if r.status_code in (401, 403):
         raise PermissionError("SESSION_EXPIRED_OR_FORBIDDEN")
-    if r.status >= 400:
+    if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status}: {r.text[:200] if hasattr(r, 'text') else ''}")
     return r.json()
 
