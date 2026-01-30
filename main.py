@@ -315,22 +315,59 @@ _session.headers.update({
 })
 
 
-def api_get(url: str, params: dict | None = None) -> Any:
-    cookie = require_cookie()
-    center_id = require_center_id()
+import os
+import requests
 
-    headers = {
-        "Cookie": cookie,
-        "Center-Id": center_id,
+BASE_API = "https://api-deliverycenter.baemin.com"
+
+def _clean_cookie(raw: str) -> str:
+    # Render 환경변수 textarea에서 줄바꿈/공백이 섞이면 헤더가 깨질 수 있어서 정리
+    if not raw:
+        return ""
+    return raw.replace("\r", " ").replace("\n", " ").strip()
+
+def _build_headers() -> dict:
+    center_id = (os.getenv("BAEMIN_CENTER_ID") or "").strip()
+    cookie = _clean_cookie(os.getenv("BAEMIN_COOKIE") or "")
+
+    if not center_id or not cookie:
+        # 너가 만든 “세션 만료/설정 오류” 화면으로 보내는 트리거로 쓰면 됨
+        raise PermissionError("SESSION_EXPIRED")
+
+    # DevTools에서 확인한 필수급 헤더들
+    return {
+        "accept": "application/json, text/plain, */*",
+        "origin": "https://deliverycenter.baemin.com",
+        "referer": "https://deliverycenter.baemin.com/",
+        "user-agent": os.getenv(
+            "BAEMIN_UA",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        ),
+        "center-id": center_id,
+        "cookie": cookie,
     }
 
-    r = _session.get(url, params=params, headers=headers, timeout=20)
+def api_get(url: str, params: dict | None = None):
+    headers = _build_headers()
 
+    # 세션 유지/재사용(가끔 클라우드플레어가 세션/쿠키에 민감)
+    with requests.Session() as s:
+        r = s.get(url, params=params, headers=headers, timeout=20)
+
+    # ✅ 여기! requests는 status가 아니라 status_code
     if r.status_code in (401, 403):
-        raise PermissionError("SESSION_EXPIRED_OR_FORBIDDEN")
+        raise PermissionError("SESSION_EXPIRED")
+
     if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status}: {r.text[:200] if hasattr(r, 'text') else ''}")
-    return r.json()
+        # 디버깅용: 앞부분만
+        raise RuntimeError(f"API_HTTP_{r.status_code}: {r.text[:200]}")
+
+    # JSON 파싱
+    try:
+        return r.json()
+    except Exception:
+        raise RuntimeError(f"API_NON_JSON: {r.text[:200]}")
+
 
 
 # -----------------------------

@@ -4,4 +4,3 @@ requests
 python-multipart
 python-dateutil
 itsdangerous
-playwright==1.49.0
