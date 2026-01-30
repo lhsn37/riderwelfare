@@ -329,6 +329,8 @@ def _clean_cookie(raw: str) -> str:
 def _build_headers() -> dict:
     center_id = (os.getenv("BAEMIN_CENTER_ID") or "").strip()
     cookie = _clean_cookie(os.getenv("BAEMIN_COOKIE") or "")
+    "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "accept-encoding": "gzip, deflate, br",
 
     if not center_id or not cookie:
         # 너가 만든 “세션 만료/설정 오류” 화면으로 보내는 트리거로 쓰면 됨
@@ -1112,18 +1114,31 @@ def health():
     """
     return html_page("Health", body)
 
-from fastapi.responses import PlainTextResponse
+ffrom fastapi.responses import JSONResponse
 
-@app.get("/debug-api", response_class=PlainTextResponse)
+@app.get("/debug-api")
 def debug_api():
     try:
-        j = api_get(f"{BASE_API}/rider", params={
-            "name": "", "userId": "", "phoneNumber": "",
-            "accountStatus": "", "orderName": "", "orderBy": ""
-        })
-        t = str(type(j))
-        head = (json.dumps(j, ensure_ascii=False)[:500] if isinstance(j, (dict, list)) else str(j)[:500])
-        return f"OK type={t}\nHEAD={head}\n"
+        headers = _build_headers()
     except Exception as e:
-        # api_get에서 raise 된 메시지 그대로 보여주기
-        return f"ERR {type(e).__name__}: {e}\n"
+        return JSONResponse({"ok": False, "stage": "build_headers", "error": str(e)})
+
+    url = f"{BASE_API}/rider"
+    params = {"name":"","userId":"","phoneNumber":"","accountStatus":"","orderName":"","orderBy":""}
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+        ct = r.headers.get("content-type","")
+        body_head = r.text[:800]  # 앞부분만
+        return JSONResponse({
+            "ok": True,
+            "status_code": r.status_code,
+            "content_type": ct,
+            "resp_head": body_head,
+            "cookie_len": len(headers.get("cookie","")),
+            "has_CENTER_SESSION": "CENTER_SESSION=" in headers.get("cookie",""),
+            "has_cf": ("__cf_bm=" in headers.get("cookie","")) or ("cf_clearance=" in headers.get("cookie","")),
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "stage": "request", "error": repr(e)})
+
