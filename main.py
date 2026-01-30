@@ -329,16 +329,14 @@ def _clean_cookie(raw: str) -> str:
 def _build_headers() -> dict:
     center_id = (os.getenv("BAEMIN_CENTER_ID") or "").strip()
     cookie = _clean_cookie(os.getenv("BAEMIN_COOKIE") or "")
-    "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "accept-encoding": "gzip, deflate, br",
 
     if not center_id or not cookie:
-        # 너가 만든 “세션 만료/설정 오류” 화면으로 보내는 트리거로 쓰면 됨
         raise PermissionError("SESSION_EXPIRED")
 
-    # DevTools에서 확인한 필수급 헤더들
     return {
         "accept": "application/json, text/plain, */*",
+        "accept-language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "accept-encoding": "gzip, deflate, br",
         "origin": "https://deliverycenter.baemin.com",
         "referer": "https://deliverycenter.baemin.com/",
         "user-agent": os.getenv(
@@ -348,6 +346,7 @@ def _build_headers() -> dict:
         "center-id": center_id,
         "cookie": cookie,
     }
+
 
 def api_get(url: str, params: dict | None = None):
     headers = _build_headers()
@@ -1114,30 +1113,44 @@ def health():
     """
     return html_page("Health", body)
 
-ffrom fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse
 
 @app.get("/debug-api")
 def debug_api():
+    # 1) 헤더 구성 확인
     try:
         headers = _build_headers()
     except Exception as e:
         return JSONResponse({"ok": False, "stage": "build_headers", "error": str(e)})
 
+    # 2) 실제 요청 (api_get 말고 requests로 직접 때려서 상태/본문 확인)
     url = f"{BASE_API}/rider"
-    params = {"name":"","userId":"","phoneNumber":"","accountStatus":"","orderName":"","orderBy":""}
+    params = {
+        "name": "",
+        "userId": "",
+        "phoneNumber": "",
+        "accountStatus": "",
+        "orderName": "",
+        "orderBy": "",
+    }
 
     try:
         r = requests.get(url, params=params, headers=headers, timeout=20)
-        ct = r.headers.get("content-type","")
-        body_head = r.text[:800]  # 앞부분만
+        ct = r.headers.get("content-type", "")
+        body_head = (r.text or "")[:800]
+
+        # ⚠️ 쿠키 전체는 절대 반환하지 말고, 존재 여부/길이만
+        cookie_val = headers.get("cookie", "") or ""
+
         return JSONResponse({
             "ok": True,
             "status_code": r.status_code,
             "content_type": ct,
             "resp_head": body_head,
-            "cookie_len": len(headers.get("cookie","")),
-            "has_CENTER_SESSION": "CENTER_SESSION=" in headers.get("cookie",""),
-            "has_cf": ("__cf_bm=" in headers.get("cookie","")) or ("cf_clearance=" in headers.get("cookie","")),
+            "cookie_len": len(cookie_val),
+            "has_CENTER_SESSION": "CENTER_SESSION=" in cookie_val,
+            "has_cf_bm": "__cf_bm=" in cookie_val,
+            "has_cf_clearance": "cf_clearance=" in cookie_val,
         })
     except Exception as e:
         return JSONResponse({"ok": False, "stage": "request", "error": repr(e)})
