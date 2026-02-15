@@ -5,3 +5,4 @@ python-dateutil
 itsdangerous
 requests
 python-dotenv
+openpyxl==3.1.5
