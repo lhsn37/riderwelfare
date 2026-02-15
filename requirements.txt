@@ -3,3 +3,5 @@ uvicorn
 python-multipart
 python-dateutil
 itsdangerous
+requests
+python-dotenv
