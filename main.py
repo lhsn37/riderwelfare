@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 # -----------------------------
 # Config
 # -----------------------------
-RIDERS_CACHE_TTL = 10  # 업로드 파일 읽기 캐시(초)
+RIDERS_CACHE_TTL = 10
 STATUS_CACHE_TTL = 10
 
 RATE_WINDOW_SEC = 60
@@ -47,17 +47,19 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "0315")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "rider-welfare-admin-secret")
 INGEST_TOKEN = (os.getenv("INGEST_TOKEN") or "").strip()
 
-OVERRIDE_FILE = "join_overrides.json"       # key: "normname|login4" -> "YYYY-MM-DD"
-LOGIN4_FILE = "login4_overrides.json"       # key: "normname|real4"  -> "login4"
+OVERRIDE_FILE = "join_overrides.json"     # key: "normname|login4" -> "YYYY-MM-DD"
+LOGIN4_FILE = "login4_overrides.json"     # key: "normname|real4"  -> "login4"
 
-# ✅ 신규: 개인 고정 보너스 / 등급별 보너스
-FIXED_BONUS_FILE = "fixed_bonus.json"       # key: "normname|real4"  -> {"bonus": int, "memo": str}
-GRADE_BONUS_FILE = "grade_bonus.json"       # key: "R1".."R5","무등급" -> int
+# ✅ "현재등급(이전)" 전용 플러스 건수 (개인별 고정)
+PREVPLUS_FILE = "prevplus_overrides.json"  # key: "normname|login4" -> int (ex 20)
+
+# ✅ PCX 이벤트 누적 집계 시작일 (고정)
+PCX_START_DATE = date(2025, 11, 26)
+PCX_LABEL = "25.11.26 ~ (어제)"
 
 _override_lock = threading.Lock()
 _login4_lock = threading.Lock()
-_fixed_bonus_lock = threading.Lock()
-_grade_bonus_lock = threading.Lock()
+_prevplus_lock = threading.Lock()
 
 _rate_bucket: Dict[str, List[float]] = {}
 
@@ -187,6 +189,10 @@ def clamp_day(year: int, month: int, target_day: int) -> date:
 
 
 def current_period(join_date: date, today: date) -> Tuple[date, date]:
+    """
+    정책기간: 시작일(입사일 day 앵커) ~ 다음달 같은 day의 '전날' (마감일 포함)
+    예) 2/11 시작이면 3/10까지가 마감(포함)
+    """
     join_day = join_date.day
     this_anchor = clamp_day(today.year, today.month, join_day)
 
@@ -196,8 +202,12 @@ def current_period(join_date: date, today: date) -> Tuple[date, date]:
         prev = date(today.year, today.month, 1) + relativedelta(months=-1)
         start_d = clamp_day(prev.year, prev.month, join_day)
 
+    # 다음달 같은 day(앵커)
     next_m = date(start_d.year, start_d.month, 1) + relativedelta(months=1)
-    end_inclusive = clamp_day(next_m.year, next_m.month, join_day)
+    next_anchor = clamp_day(next_m.year, next_m.month, join_day)
+
+    # ✅ 마감일(포함) = 다음 앵커 전날
+    end_inclusive = next_anchor - timedelta(days=1)
     return start_d, end_inclusive
 
 
@@ -301,63 +311,49 @@ def get_effective_join_date_by_login_key(rider: Dict[str, Any], login4: str) -> 
 
 
 # -----------------------------
-# ✅ Bonus helpers (persistent, file-based)
+# ✅ PrevPlus override (persistent) : "현재등급(이전) 전용 +건수"
 # -----------------------------
-def load_fixed_bonus() -> Dict[str, Dict[str, Any]]:
-    with _fixed_bonus_lock:
-        if not os.path.exists(FIXED_BONUS_FILE):
+def load_prevplus_map() -> Dict[str, int]:
+    with _prevplus_lock:
+        if not os.path.exists(PREVPLUS_FILE):
             return {}
         try:
-            with open(FIXED_BONUS_FILE, "r", encoding="utf-8") as f:
+            with open(PREVPLUS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-
-def save_fixed_bonus(data: Dict[str, Dict[str, Any]]) -> None:
-    with _fixed_bonus_lock:
-        with open(FIXED_BONUS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_fixed_bonus(real_key: str) -> Tuple[int, str]:
-    d = load_fixed_bonus()
-    row = d.get(real_key) or {}
-    try:
-        b = int(row.get("bonus", 0))
-    except Exception:
-        b = 0
-    memo = str(row.get("memo", "") or "")
-    return b, memo
-
-
-def load_grade_bonus_map() -> Dict[str, int]:
-    default = {"무등급": 0, "R5": 0, "R4": 0, "R3": 0, "R2": 0, "R1": 0}
-    with _grade_bonus_lock:
-        if not os.path.exists(GRADE_BONUS_FILE):
-            return default
-        try:
-            with open(GRADE_BONUS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return default
-            out = default.copy()
-            for k, v in data.items():
-                if k in out:
+            out: Dict[str, int] = {}
+            if isinstance(data, dict):
+                for k, v in data.items():
                     try:
-                        out[k] = int(v)
+                        out[str(k)] = int(v)
                     except Exception:
                         pass
             return out
         except Exception:
-            return default
+            return {}
 
 
-def save_grade_bonus_map(m: Dict[str, int]) -> None:
-    with _grade_bonus_lock:
-        with open(GRADE_BONUS_FILE, "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False, indent=2)
+def save_prevplus_map(data: Dict[str, int]) -> None:
+    with _prevplus_lock:
+        with open(PREVPLUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_prevplus(login_key: str) -> int:
+    m = load_prevplus_map()
+    return int(m.get(login_key, 0) or 0)
+
+
+def set_prevplus(login_key: str, v: int) -> None:
+    m = load_prevplus_map()
+    m[login_key] = int(v)
+    save_prevplus_map(m)
+
+
+def clear_prevplus(login_key: str) -> None:
+    m = load_prevplus_map()
+    if login_key in m:
+        del m[login_key]
+    save_prevplus_map(m)
 
 
 # -----------------------------
@@ -422,6 +418,12 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
 
     _status_cache[key] = {"ts": now, "data": out}
     return out
+
+
+def has_status_range(from_d: date, to_d: date) -> bool:
+    key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+    all_status = _read_json(STATUS_STORE, {}) or {}
+    return isinstance(all_status, dict) and (key in all_status)
 
 
 def store_ready() -> bool:
@@ -504,7 +506,8 @@ def ingest_ranges(request: Request):
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
-        prev_start = cur_start - relativedelta(months=1)
+        prev_m = date(cur_start.year, cur_start.month, 1) + relativedelta(months=-1)
+        prev_start = clamp_day(prev_m.year, prev_m.month, eff_join.day)
         prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
         ranges.add((cur_from.isoformat(), cur_to.isoformat()))
@@ -591,8 +594,8 @@ def check_get_redirect():
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_help():
-    body = """
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:720px; margin:0 auto;">
+    body = f"""
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:820px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">관리자</h2>
       <div style="color:#666; margin-bottom:12px;">
         이 서버(Render)는 배민 API를 직접 호출하지 않습니다.<br/>
@@ -603,6 +606,12 @@ def admin_help():
         <div><b>Render 설정</b></div>
         <div>- Settings → Environment → <b>INGEST_TOKEN</b> 등록</div>
         <div>- Start Command: <span style="font-family: ui-monospace;">uvicorn main:app --host 0.0.0.0 --port $PORT</span></div>
+      </div>
+
+      <div style="margin-top:14px; background:#fff8e8; border:1px solid #ffe1a8; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
+        <div><b>PCX 누적 집계</b></div>
+        <div>- 개인조회 화면에 <b>{PCX_LABEL}</b> 누적 완료건수를 보여줍니다.</div>
+        <div>- 단, PC에서 그 기간({PCX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
       </div>
 
       <div style="margin-top:14px;">
@@ -647,7 +656,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     candidates = [r for r in riders if norm_name(r.get("name", "")) == name_in]
     matches: List[Dict[str, Any]] = []
     for r in candidates:
-        l4, real4, src = get_login4_for_rider(r)
+        l4, real4, _ = get_login4_for_rider(r)
         if l4 == login4:
             matches.append(r)
 
@@ -673,7 +682,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
         return html_page("동일 정보 다수", body)
 
     rider = matches[0]
-    rider_login4, rider_real4, login_src = get_login4_for_rider(rider)
+    rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, join_src = get_effective_join_date_by_login_key(rider, rider_login4)
 
     today = date.today()
@@ -682,45 +691,42 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
     prev_end_incl = cur_start - timedelta(days=1)
-    prev_start = cur_start - relativedelta(months=1)
+    prev_m = date(cur_start.year, cur_start.month, 1) + relativedelta(months=-1)
+    prev_start = clamp_day(prev_m.year, prev_m.month, eff_join_date.day)
     prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
     cmap_cur = fetch_status_complete_map_cached(cur_from, cur_to)
     cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
 
     api_key = f"{name_in}|{rider_real4}"
-    cur_completed = int(cmap_cur.get(api_key, 0))
-    prev_completed = int(cmap_prev.get(api_key, 0))
+    cur_completed_raw = int(cmap_cur.get(api_key, 0))
+    prev_completed_raw = int(cmap_prev.get(api_key, 0))
 
-    # ✅ 보너스 적용
-    current_grade = grade_from_total(prev_completed)  # 이전기간 등급
-    grade_bonus_map = load_grade_bonus_map()
-    grade_bonus = int(grade_bonus_map.get(current_grade, 0))
+    # ✅ 이전등급(이전기간) 전용 플러스
+    login_key = f"{name_in}|{rider_login4}"
+    prev_plus = get_prevplus(login_key)
 
-    fixed_bonus, fixed_memo = get_fixed_bonus(api_key)
+    # 등급 계산:
+    # - 예정등급(현재기간) = "현재기간 완료건수" 그대로
+    # - 현재등급(이전기간) = "이전기간 완료건수 + prev_plus"
+    planned_grade = grade_from_total(cur_completed_raw)
+    current_grade = grade_from_total(prev_completed_raw + prev_plus)
 
-    effective_total = cur_completed + grade_bonus + fixed_bonus
-    planned_grade = grade_from_total(effective_total)
-    nxt, remain = next_grade_target(effective_total)
+    # 다음등급/남은건수는 "예정등급(현재기간)" 기준(요청대로 유지)
+    nxt, remain = next_grade_target(cur_completed_raw)
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
-    bonus_line = ""
-    if grade_bonus or fixed_bonus:
-        memo_txt = f" ({fixed_memo})" if fixed_memo else ""
-        bonus_line = f"""
-        <div style="margin-top:10px; padding:10px 12px; border:1px dashed #ddd; border-radius:12px; background:#fff;">
-          <div style="color:#666; font-size:13px;">보너스 적용</div>
-          <div style="margin-top:6px; font-size:14px; line-height:1.5;">
-            등급보너스(현재등급 {current_grade}): <b>+{grade_bonus}</b>건<br/>
-            개인보너스: <b>+{fixed_bonus}</b>건{memo_txt}<br/>
-            <span style="color:#999; font-size:12px;">→ 현재기간 완료 {cur_completed} + 보너스 = <b>{effective_total}</b></span>
-          </div>
-        </div>
-        """
+    # ✅ PCX 누적 (25.11.26 ~ 어제)
+    pcx_from = PCX_START_DATE
+    pcx_to = date.today() - timedelta(days=1)
+    pcx_text = "데이터 없음(업로드 필요)"
+    if pcx_from <= pcx_to and has_status_range(pcx_from, pcx_to):
+        cmap_pcx = fetch_status_complete_map_cached(pcx_from, pcx_to)
+        pcx_text = f"{int(cmap_pcx.get(api_key, 0))}건"
 
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:780px; margin:0 auto;">
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:860px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">등급 조회 결과</h2>
 
       <div style="color:#888; font-size:13px; margin-top:6px;">
@@ -733,32 +739,41 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
       </div>
 
       <div style="display:flex; gap:12px; margin-top:12px; flex-wrap:wrap;">
-        <div style="flex:1; min-width:230px; padding:12px; border-radius:12px; border:1px solid #eee; background:#fff;">
-          <div style="color:#777; font-size:13px;">현재등급(직전기간)</div>
+        <div style="flex:1; min-width:250px; padding:12px; border-radius:12px; border:1px solid #eee; background:#fff;">
+          <div style="color:#777; font-size:13px;">현재등급(이전기간)</div>
           <div style="font-size:32px; font-weight:900; line-height:1.1;">{current_grade}</div>
           <div style="font-size:12px; color:#999; margin-top:6px;">
             정책기간: {prev_start} ~ {prev_end_incl}<br/>
-            반영기간(업로드): {prev_from} ~ {prev_to} / 완료 {prev_completed}건
+            반영기간(업로드): {prev_from} ~ {prev_to}<br/>
+            완료 {prev_completed_raw}건 + 이전등급플러스 {prev_plus}건 = <b>{prev_completed_raw + prev_plus}</b>건
           </div>
         </div>
 
-        <div style="flex:1; min-width:230px; padding:12px; border-radius:12px; border:1px solid #eee; background:#fff;">
-          <div style="color:#777; font-size:13px;">예정등급(현재기간, 보너스 반영)</div>
+        <div style="flex:1; min-width:250px; padding:12px; border-radius:12px; border:1px solid #eee; background:#fff;">
+          <div style="color:#777; font-size:13px;">예정등급(현재기간)</div>
           <div style="font-size:32px; font-weight:900; line-height:1.1;">{planned_grade}</div>
           <div style="font-size:12px; color:#999; margin-top:6px;">
             정책기간: {cur_start} ~ {cur_end_incl}<br/>
-            반영기간(업로드): {cur_from} ~ {cur_to} / 완료 {cur_completed}건
+            반영기간(업로드): {cur_from} ~ {cur_to}<br/>
+            완료 <b>{cur_completed_raw}</b>건
           </div>
         </div>
       </div>
-
-      {bonus_line}
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
         <div style="color:#666;">
           다음등급: <b>{(nxt or '-')}</b> / 남은건수: <b>{(remain if remain is not None else '-')}</b>
         </div>
-        <div style="color:#999; font-size:12px; margin-top:6px;">* 다음등급/남은건수는 “현재기간 + 보너스” 기준입니다.</div>
+        <div style="color:#999; font-size:12px; margin-top:6px;">* 다음등급/남은건수는 “현재기간 완료건수” 기준입니다.</div>
+      </div>
+
+      <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
+        <div style="font-weight:900; margin-bottom:6px;">PCX 이벤트 누적 완료건수</div>
+        <div style="color:#666;">기간: <b>{PCX_LABEL}</b></div>
+        <div style="font-size:22px; font-weight:900; margin-top:6px;">{pcx_text}</div>
+        <div style="color:#999; font-size:12px; margin-top:6px;">
+          * 이 숫자는 PC에서 <b>{PCX_START_DATE.isoformat()} ~ 어제</b> 범위를 업로드했을 때만 표시됩니다.
+        </div>
       </div>
 
       <div style="margin-top:14px;">
@@ -818,7 +833,7 @@ def admin_logout(request: Request):
 
 
 # -----------------------------
-# Admin: join/login4 set/clear
+# Admin: join/login4/prevplus set/clear
 # -----------------------------
 @app.post("/admin/set-join")
 def admin_set_join(request: Request, key: str = Form(...), join_date: str = Form(...), redirect_q: str = Form(default="")):
@@ -883,250 +898,40 @@ def admin_clear_login4(request: Request, name_norm: str = Form(...), real4: str 
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
 
-# -----------------------------
-# ✅ Admin: bonus set/clear (persistent)
-# -----------------------------
-@app.post("/admin/set-fixed-bonus")
-def admin_set_fixed_bonus(
-    request: Request,
-    real_key: str = Form(...),
-    bonus: str = Form(default="0"),
-    memo: str = Form(default=""),
-    redirect_q: str = Form(default="")
-):
+@app.post("/admin/set-prevplus")
+def admin_set_prevplus(request: Request, key: str = Form(...), prevplus: str = Form(...), redirect_q: str = Form(default="")):
     r = require_admin(request)
     if r:
         return r
 
-    real_key = (real_key or "").strip()
+    key = (key or "").strip()
     try:
-        b = int((bonus or "0").strip())
+        v = int((prevplus or "0").strip())
     except Exception:
-        b = 0
+        v = 0
 
-    data = load_fixed_bonus()
-    data[real_key] = {"bonus": b, "memo": (memo or "").strip()}
-    save_fixed_bonus(data)
+    if not key:
+        return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
+
+    if v < -999:
+        v = -999
+    if v > 999:
+        v = 999
+
+    set_prevplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
 
-@app.post("/admin/clear-fixed-bonus")
-def admin_clear_fixed_bonus(
-    request: Request,
-    real_key: str = Form(...),
-    redirect_q: str = Form(default="")
-):
+@app.post("/admin/clear-prevplus")
+def admin_clear_prevplus(request: Request, key: str = Form(...), redirect_q: str = Form(default="")):
     r = require_admin(request)
     if r:
         return r
 
-    real_key = (real_key or "").strip()
-    data = load_fixed_bonus()
-    if real_key in data:
-        del data[real_key]
-        save_fixed_bonus(data)
+    key = (key or "").strip()
+    if key:
+        clear_prevplus(key)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
-
-
-@app.post("/admin/set-grade-bonus")
-def admin_set_grade_bonus(
-    request: Request,
-    g_r1: str = Form(default="0"),
-    g_r2: str = Form(default="0"),
-    g_r3: str = Form(default="0"),
-    g_r4: str = Form(default="0"),
-    g_r5: str = Form(default="0"),
-    g_none: str = Form(default="0"),
-    redirect_q: str = Form(default="")
-):
-    r = require_admin(request)
-    if r:
-        return r
-
-    def _to_int(x: str) -> int:
-        try:
-            return int((x or "0").strip())
-        except Exception:
-            return 0
-
-    m = {
-        "R1": _to_int(g_r1),
-        "R2": _to_int(g_r2),
-        "R3": _to_int(g_r3),
-        "R4": _to_int(g_r4),
-        "R5": _to_int(g_r5),
-        "무등급": _to_int(g_none),
-    }
-    save_grade_bonus_map(m)
-    return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
-
-
-# -----------------------------
-# ✅ Admin: Excel export
-# -----------------------------
-@app.get("/admin/export.xlsx")
-def admin_export_xlsx(request: Request, q: str = ""):
-    r = require_admin(request)
-    if r:
-        return r
-    if not store_ready():
-        return not_ready_page()
-
-    # 재사용: dashboard 계산 로직과 동일하게 구성
-    riders = fetch_riders_cached()
-    qn = norm_name(q)
-
-    rider_rows = []
-    for rr in riders:
-        nm = rr.get("name") or ""
-        ph = rr.get("phoneNumber") or ""
-        real4 = last4_from_phone(ph)
-        if not real4:
-            continue
-        if qn and (qn not in (norm_name(nm) + real4)):
-            continue
-        rider_rows.append(rr)
-
-    today = date.today()
-    cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
-    prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
-    computed_rows: List[Dict[str, Any]] = []
-
-    for rr in rider_rows:
-        nm = rr.get("name") or ""
-        ph = rr.get("phoneNumber") or ""
-        real4 = last4_from_phone(ph)
-        nn = norm_name(nm)
-
-        login4, _, login_src = get_login4_for_rider(rr)
-        real_key = f"{nn}|{real4}"
-        login_key = f"{nn}|{login4}"
-
-        eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
-
-        cur_start, cur_end_incl = current_period(eff_join, today)
-        cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
-
-        prev_end_incl = cur_start - timedelta(days=1)
-        prev_start = cur_start - relativedelta(months=1)
-        prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
-
-        item = {
-            "rider": rr,
-            "nn": nn,
-            "real4": real4,
-            "login4": login4,
-            "login_src": login_src,
-            "real_key": real_key,
-            "login_key": login_key,
-            "eff_join": eff_join,
-            "join_src": join_src,
-            "cur_start": cur_start,
-            "cur_end_incl": cur_end_incl,
-            "cur_from": cur_from,
-            "cur_to": cur_to,
-            "prev_start": prev_start,
-            "prev_end_incl": prev_end_incl,
-            "prev_from": prev_from,
-            "prev_to": prev_to,
-        }
-
-        cur_group.setdefault((cur_from, cur_to), []).append(item)
-        prev_group.setdefault((prev_from, prev_to), []).append(item)
-        computed_rows.append(item)
-
-    prev_completed_map: Dict[str, int] = {}
-    for (from_d, to_d), items in prev_group.items():
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
-        for it in items:
-            prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
-
-    grade_bonus_map = load_grade_bonus_map()
-    fixed_bonus_data = load_fixed_bonus()
-
-    rows = []
-    for (from_d, to_d), items in cur_group.items():
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
-        for it in items:
-            rr = it["rider"]
-            nm = rr.get("name") or ""
-
-            cur_completed = int(cmap.get(it["real_key"], 0))
-            prev_completed = int(prev_completed_map.get(it["real_key"], 0))
-
-            current_grade = grade_from_total(prev_completed)
-            grade_bonus = int(grade_bonus_map.get(current_grade, 0))
-
-            fb_row = fixed_bonus_data.get(it["real_key"]) or {}
-            try:
-                fixed_bonus = int(fb_row.get("bonus", 0))
-            except Exception:
-                fixed_bonus = 0
-            fixed_memo = str(fb_row.get("memo", "") or "")
-
-            effective_total = cur_completed + grade_bonus + fixed_bonus
-            planned_grade = grade_from_total(effective_total)
-            nxt, remain = next_grade_target(effective_total)
-
-            rows.append({
-                "name": nm,
-                "real4": it["real4"],
-                "login4": it["login4"],
-                "policy_from": it["cur_start"].isoformat(),
-                "policy_to": it["cur_end_incl"].isoformat(),
-                "api_from": it["cur_from"].isoformat(),
-                "api_to": it["cur_to"].isoformat(),
-                "cur_completed_raw": cur_completed,
-                "fixed_bonus": fixed_bonus,
-                "fixed_memo": fixed_memo,
-                "grade_bonus": grade_bonus,
-                "effective_total": effective_total,
-                "current_grade": current_grade,
-                "planned_grade": planned_grade,
-                "next": nxt or "-",
-                "remain": remain if remain is not None else "-",
-            })
-
-    rows.sort(key=lambda x: x["effective_total"], reverse=True)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Dashboard"
-
-    headers = [
-        "#", "이름", "배민뒷4", "로그인뒷4",
-        "정책기간_from", "정책기간_to", "업로드_from", "업로드_to",
-        "완료(원본)", "개인보너스", "개인메모", "등급보너스(현재등급)", "합산(보너스반영)",
-        "현재등급(이전)", "예정등급(현재)", "다음등급", "남은건수"
-    ]
-    ws.append(headers)
-
-    for i, rrow in enumerate(rows, start=1):
-        ws.append([
-            i, rrow["name"], rrow["real4"], rrow["login4"],
-            rrow["policy_from"], rrow["policy_to"], rrow["api_from"], rrow["api_to"],
-            rrow["cur_completed_raw"], rrow["fixed_bonus"], rrow["fixed_memo"],
-            rrow["grade_bonus"], rrow["effective_total"],
-            rrow["current_grade"], rrow["planned_grade"], rrow["next"], rrow["remain"]
-        ])
-
-    # column widths
-    for col_idx in range(1, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
-    ws.column_dimensions["A"].width = 6
-    ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["K"].width = 22
-
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-
-    filename = f"riderwelfare_dashboard_{date.today().isoformat()}.xlsx"
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
 
 
 # -----------------------------
@@ -1143,9 +948,7 @@ def dashboard(request: Request, q: str = ""):
 
     riders = fetch_riders_cached()
     join_overrides = load_overrides()
-    fixed_bonus_data = load_fixed_bonus()
-    grade_bonus_map = load_grade_bonus_map()
-
+    prevplus_map = load_prevplus_map()
     qn = norm_name(q)
 
     rider_rows = []
@@ -1224,23 +1027,14 @@ def dashboard(request: Request, q: str = ""):
             created_raw = rr.get("createdDate")
             created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
 
-            cur_completed = int(cmap.get(it["real_key"], 0))
-            prev_completed = int(prev_completed_map.get(it["real_key"], 0))
+            cur_completed_raw = int(cmap.get(it["real_key"], 0))
+            prev_completed_raw = int(prev_completed_map.get(it["real_key"], 0))
 
-            current_grade = grade_from_total(prev_completed)
-            grade_bonus = int(grade_bonus_map.get(current_grade, 0))
+            prev_plus = int(prevplus_map.get(it["login_key"], 0) or 0)
 
-            fb = fixed_bonus_data.get(it["real_key"]) or {}
-            try:
-                fixed_bonus = int(fb.get("bonus", 0))
-            except Exception:
-                fixed_bonus = 0
-            fixed_memo = str(fb.get("memo", "") or "")
-
-            effective_total = cur_completed + grade_bonus + fixed_bonus
-
-            planned_grade = grade_from_total(effective_total)
-            nxt, remain = next_grade_target(effective_total)
+            planned_grade = grade_from_total(cur_completed_raw)
+            current_grade = grade_from_total(prev_completed_raw + prev_plus)
+            nxt, remain = next_grade_target(cur_completed_raw)
 
             ov = join_overrides.get(it["login_key"])
             join_default_val = ov if ov else it["eff_join"].isoformat()
@@ -1266,49 +1060,21 @@ def dashboard(request: Request, q: str = ""):
                 "policy_to": it["cur_end_incl"].isoformat(),
                 "api_from": it["cur_from"].isoformat(),
                 "api_to": it["cur_to"].isoformat(),
-                "cur_completed": cur_completed,
-                "prev_completed": prev_completed,
+                "cur_completed_raw": cur_completed_raw,
+                "prev_completed_raw": prev_completed_raw,
+                "prev_plus": prev_plus,
                 "current_grade": current_grade,
-                "grade_bonus": grade_bonus,
-                "fixed_bonus": fixed_bonus,
-                "fixed_memo": fixed_memo,
-                "effective_total": effective_total,
                 "planned_grade": planned_grade,
                 "next": nxt or "-",
                 "remain": remain if remain is not None else "-",
                 "login_key": it["login_key"],
                 "name_norm": it["nn"],
-                "real_key": it["real_key"],
             })
 
-    # ✅ 정렬 기준: 보너스 반영 합산
-    final_rows.sort(key=lambda x: x["effective_total"], reverse=True)
-
-    # 상단 등급 보너스 설정 폼
-    gb = grade_bonus_map
-    grade_bonus_form = f"""
-    <div style="margin-top:14px; background:#f7f7f7; border:1px solid #eee; border-radius:14px; padding:12px;">
-      <div style="font-weight:900; margin-bottom:8px;">등급별 보너스 설정 (현재등급 기준으로 자동 적용)</div>
-      <form method="post" action="/admin/set-grade-bonus" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
-        <input type="hidden" name="redirect_q" value="{q}" />
-        <div><div style="font-size:12px;color:#666;">R1</div><input name="g_r1" value="{gb.get('R1',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-        <div><div style="font-size:12px;color:#666;">R2</div><input name="g_r2" value="{gb.get('R2',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-        <div><div style="font-size:12px;color:#666;">R3</div><input name="g_r3" value="{gb.get('R3',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-        <div><div style="font-size:12px;color:#666;">R4</div><input name="g_r4" value="{gb.get('R4',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-        <div><div style="font-size:12px;color:#666;">R5</div><input name="g_r5" value="{gb.get('R5',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-        <div><div style="font-size:12px;color:#666;">무등급</div><input name="g_none" value="{gb.get('무등급',0)}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;"/></div>
-
-        <button type="submit" style="padding:9px 14px;border:none;border-radius:10px;background:#111;color:#fff;">저장</button>
-      </form>
-      <div style="margin-top:6px; font-size:12px; color:#777;">
-        * 예: 현재등급이 R4인 사람은 ‘등급보너스 R4’가 예정등급 계산에 매달 자동으로 +됩니다.
-      </div>
-    </div>
-    """
+    final_rows.sort(key=lambda x: x["cur_completed_raw"], reverse=True)
 
     tr_html = ""
     for i, it in enumerate(final_rows, start=1):
-        memo_small = f"<div style='font-size:12px;color:#999;margin-top:4px;'>{it['fixed_memo']}</div>" if it["fixed_memo"] else ""
         tr_html += f"""
         <tr>
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">{i}</td>
@@ -1374,51 +1140,40 @@ def dashboard(request: Request, q: str = ""):
             <div style="font-size:12px; color:#999; margin-top:4px;">업로드 반영: {it['api_from']} ~ {it['api_to']}</div>
           </td>
 
-          <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; font-weight:900;">{it['cur_completed']}</td>
+          <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; font-weight:900;">{it['cur_completed_raw']}</td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
             <div style="font-weight:900;">{it['current_grade']}</div>
-            <div style="font-size:12px; color:#999;">({it['prev_completed']}건)</div>
-          </td>
-
-          <td style="padding:10px; border-bottom:1px solid #eee; text-align:center; color:#666;">
-            <div style="font-size:12px;color:#777;">등급보너스</div>
-            <div style="font-weight:900;">+{it['grade_bonus']}</div>
-          </td>
-
-          <td style="padding:10px; border-bottom:1px solid #eee; text-align:center; color:#666;">
-            <div style="font-size:12px;color:#777;">개인보너스</div>
-            <div style="font-weight:900;">+{it['fixed_bonus']}</div>
-            {memo_small}
-            <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; justify-content:center;">
-              <form method="post" action="/admin/set-fixed-bonus" style="display:flex; gap:6px; align-items:center;">
-                <input type="hidden" name="real_key" value="{it['real_key']}" />
-                <input type="hidden" name="redirect_q" value="{q}" />
-                <input name="bonus" value="{it['fixed_bonus']}" style="width:90px;padding:8px;border:1px solid #ddd;border-radius:10px;" />
-                <input name="memo" value="{it['fixed_memo']}" placeholder="메모(스티커 등)"
-                       style="width:160px;padding:8px;border:1px solid #ddd;border-radius:10px;" />
-                <button type="submit" style="padding:8px 10px;border:none;border-radius:10px;background:#111;color:#fff;">저장</button>
-              </form>
-              <form method="post" action="/admin/clear-fixed-bonus">
-                <input type="hidden" name="real_key" value="{it['real_key']}" />
-                <input type="hidden" name="redirect_q" value="{q}" />
-                <button type="submit" style="padding:8px 10px;border:1px solid #ddd;border-radius:10px;background:#fff;color:#111;">초기화</button>
-              </form>
-            </div>
+            <div style="font-size:12px; color:#999;">이전 {it['prev_completed_raw']} + 플러스 {it['prev_plus']}</div>
           </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-            <div style="font-size:12px;color:#777;">합산(보너스반영)</div>
-            <div style="font-weight:900;">{it['effective_total']}</div>
-          </td>
-
-          <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-            <div style="font-size:12px;color:#777;">예정등급(현재)</div>
             <div style="font-weight:900;">{it['planned_grade']}</div>
+            <div style="font-size:12px; color:#999;">현재</div>
           </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:center; color:#666;">{it['next']}</td>
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#666;">{it['remain']}</td>
+
+          <td style="padding:10px; border-bottom:1px solid #eee; color:#666; min-width:260px;">
+            <div style="font-weight:700;">현재등급(이전) 플러스</div>
+            <div style="font-size:12px; color:#999;">이전등급 계산에만 적용</div>
+            <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+              <form method="post" action="/admin/set-prevplus" style="display:flex; gap:6px; align-items:center;">
+                <input type="hidden" name="key" value="{it['login_key']}" />
+                <input type="hidden" name="redirect_q" value="{q}" />
+                <input name="prevplus" value="{it['prev_plus']}" placeholder="예: 20"
+                       style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+                <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
+              </form>
+
+              <form method="post" action="/admin/clear-prevplus">
+                <input type="hidden" name="key" value="{it['login_key']}" />
+                <input type="hidden" name="redirect_q" value="{q}" />
+                <button type="submit" style="padding:8px 10px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">초기화</button>
+              </form>
+            </div>
+          </td>
         </tr>
         """
 
@@ -1429,17 +1184,17 @@ def dashboard(request: Request, q: str = ""):
           <h2 style="margin:0 0 6px 0;">전체 등급 현황</h2>
           <div style="color:#666;">
             - <b>계약종료</b> 라이더는 자동 제외<br/>
-            - <b>로그인뒷4</b>는 관리자에서 변경 가능(기사들끼리 실제 번호 알아도 로그인 차단)<br/>
-            - <b>예정등급</b>은 “현재기간 완료 + (등급보너스+개인보너스)” 반영 기준
+            - <b>현재등급(이전)</b>은 “이전기간 완료건수 + 플러스(개인별)”로 계산<br/>
+            - <b>예정등급(현재)</b>은 “현재기간 완료건수”로 계산<br/>
           </div>
           <div style="color:#888; font-size:13px; margin-top:6px;">
             * 완료건수는 ‘어제까지’ 확정치 기준(업로드 데이터).
           </div>
         </div>
 
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div style="display:flex; gap:10px; align-items:center;">
+          <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">엑셀 다운로드</a>
           <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
-          <a href="/admin/export.xlsx?q={q}" style="text-decoration:none; color:#111;">엑셀 다운로드</a>
           <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
         </div>
       </div>
@@ -1454,10 +1209,8 @@ def dashboard(request: Request, q: str = ""):
         </button>
       </form>
 
-      {grade_bonus_form}
-
       <div style="margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px;">
-        <table style="border-collapse:collapse; width:100%; min-width:1900px;">
+        <table style="border-collapse:collapse; width:100%; min-width:1800px;">
           <thead>
             <tr style="background:#fafafa;">
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">#</th>
@@ -1466,24 +1219,156 @@ def dashboard(request: Request, q: str = ""):
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">배민 입사일</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">기준일(수정가능)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">평가기간</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:right;">완료(원본)</th>
+              <th style="padding:10px; border-bottom:1px solid #eee; text-align:right;">완료(현재)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">현재등급(이전)</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">등급보너스</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">개인보너스</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">합산</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">예정등급</th>
+              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">예정등급(현재)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">다음등급</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:right;">남은건수</th>
+              <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">이전등급 플러스</th>
             </tr>
           </thead>
           <tbody>
-            {tr_html if tr_html else '<tr><td colspan="14" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>'}
+            {tr_html if tr_html else '<tr><td colspan="12" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>'}
           </tbody>
         </table>
       </div>
     </div>
     """
     return html_page("전체 등급 현황", body)
+
+
+# -----------------------------
+# Excel export (admin only)
+# -----------------------------
+@app.get("/dashboard.xlsx")
+def dashboard_excel(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+
+    if not store_ready():
+        return not_ready_page()
+
+    riders = fetch_riders_cached()
+    prevplus_map = load_prevplus_map()
+
+    today = date.today()
+
+    cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
+    prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
+
+    items_all: List[Dict[str, Any]] = []
+
+    for rr in riders:
+        nm = rr.get("name") or ""
+        ph = rr.get("phoneNumber") or ""
+        real4 = last4_from_phone(ph)
+        if not real4:
+            continue
+
+        nn = norm_name(nm)
+        login4, _, _ = get_login4_for_rider(rr)
+        real_key = f"{nn}|{real4}"
+        login_key = f"{nn}|{login4}"
+
+        eff_join, _ = get_effective_join_date_by_login_key(rr, login4)
+
+        cur_start, cur_end_incl = current_period(eff_join, today)
+        cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
+
+        prev_end_incl = cur_start - timedelta(days=1)
+        prev_start = cur_start - relativedelta(months=1)
+        prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
+
+        it = {
+            "name": nm,
+            "login4": login4,
+            "real4": real4,
+            "real_key": real_key,
+            "login_key": login_key,
+            "join_effective": eff_join.isoformat(),
+            "policy_from": cur_start.isoformat(),
+            "policy_to": cur_end_incl.isoformat(),
+            "api_from": cur_from.isoformat(),
+            "api_to": cur_to.isoformat(),
+            "prev_policy_from": prev_start.isoformat(),
+            "prev_policy_to": prev_end_incl.isoformat(),
+            "prev_api_from": prev_from.isoformat(),
+            "prev_api_to": prev_to.isoformat(),
+            "prev_plus": int(prevplus_map.get(login_key, 0) or 0),
+        }
+
+        cur_group.setdefault((cur_from, cur_to), []).append(it)
+        prev_group.setdefault((prev_from, prev_to), []).append(it)
+        items_all.append(it)
+
+    prev_completed_map: Dict[str, int] = {}
+    for (from_d, to_d), items in prev_group.items():
+        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        for it in items:
+            prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
+
+    rows = []
+    for (from_d, to_d), items in cur_group.items():
+        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        for it in items:
+            cur_raw = int(cmap.get(it["real_key"], 0))
+            prev_raw = int(prev_completed_map.get(it["real_key"], 0))
+            prev_plus = int(it["prev_plus"])
+
+            planned_grade = grade_from_total(cur_raw)
+            current_grade = grade_from_total(prev_raw + prev_plus)
+            nxt, remain = next_grade_target(cur_raw)
+
+            rows.append({
+                "name": it["name"],
+                "login4": it["login4"],
+                "real4": it["real4"],
+                "join_effective": it["join_effective"],
+                "policy_from": it["policy_from"],
+                "policy_to": it["policy_to"],
+                "api_from": it["api_from"],
+                "api_to": it["api_to"],
+                "cur_completed": cur_raw,
+                "prev_completed": prev_raw,
+                "prev_plus": prev_plus,
+                "prev_total_for_grade": prev_raw + prev_plus,
+                "current_grade_prev": current_grade,
+                "planned_grade_cur": planned_grade,
+                "next": nxt or "",
+                "remain": remain if remain is not None else "",
+            })
+
+    rows.sort(key=lambda x: x["cur_completed"], reverse=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "dashboard"
+
+    headers = [
+        "name", "login4", "real4", "join_effective",
+        "policy_from", "policy_to", "api_from", "api_to",
+        "cur_completed",
+        "prev_completed", "prev_plus", "prev_total_for_grade",
+        "current_grade_prev", "planned_grade_cur", "next", "remain",
+    ]
+    ws.append(headers)
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+
+    for i, h in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = max(12, min(24, len(h) + 4))
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    filename = f"riderwelfare_dashboard_{date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # -----------------------------
@@ -1496,14 +1381,30 @@ def health():
     riders_ts = _read_json(RIDERS_STORE, {}).get("ts")
     status_keys = list((_read_json(STATUS_STORE, {}) or {}).keys())[:5]
 
+    # PCX 범위 데이터 유무 표시
+    pcx_from = PCX_START_DATE
+    pcx_to = date.today() - timedelta(days=1)
+    pcx_ready = (pcx_from <= pcx_to) and has_status_range(pcx_from, pcx_to)
+
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:720px; margin:0 auto;">
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:820px; margin:0 auto;">
       <h3 style="margin-top:0;">Health</h3>
       <div>ingest_token_set: <b>{ok_token}</b></div>
       <div>riders_uploaded: <b>{riders_ok}</b></div>
       <div>riders_ts: <b>{riders_ts}</b></div>
       <div style="margin-top:8px;">status_keys(sample): <b>{status_keys}</b></div>
+      <div style="margin-top:8px;">pcx_range_ready({PCX_START_DATE.isoformat()}~어제): <b>{pcx_ready}</b></div>
       <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 홈</a></div>
     </div>
     """
     return html_page("Health", body)
+
+import os, time
+
+@app.get("/version")
+def version():
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "render_git": os.getenv("RENDER_GIT_COMMIT", ""),  # 있으면 뜸
+    }

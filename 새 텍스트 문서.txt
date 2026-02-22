@@ -1,1 +1,9 @@
-python-3.12.8
+python login_once.py
+
+fastapi
+uvicorn
+python-multipart
+python-dateutil
+itsdangerous
+requests
+openpyxl==3.1.5
