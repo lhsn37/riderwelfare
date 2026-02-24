@@ -2,7 +2,7 @@
 # ------------------------------------------------------------------------------------
 # 구조
 # - PC(collector.py): 배민 API 호출(쿠키/센터ID는 PC에만) → Render로 업로드
-# - Render(main.py): 업로드된 riders/status JSON만 읽어서 /check /dashboard 제공
+# - Render(main.py): 업로드된 riders/status/delivery-status JSON만 읽어서 /check /dashboard 제공
 #
 # Render 환경변수(필수)
 # - INGEST_TOKEN : 업로드 인증 토큰(긴 문자열)
@@ -38,6 +38,7 @@ from starlette.responses import StreamingResponse
 # -----------------------------
 RIDERS_CACHE_TTL = 10
 STATUS_CACHE_TTL = 10
+DELIVERY_STATUS_CACHE_TTL = 5  # ✅ 배달현황 캐시 (실시간)
 
 RATE_WINDOW_SEC = 60
 RATE_MAX_REQ = 30
@@ -52,8 +53,15 @@ LOGIN4_FILE = "login4_overrides.json"  # key: "normname|real4"  -> "login4"
 # ✅ "현재등급(이전)" 전용 플러스 건수 (개인별 고정)
 PREVPLUS_FILE = "prevplus_overrides.json"  # key: "normname|login4" -> int (ex 20)
 
-# ✅ "예정등급(현재)" 전용 플러스 건수 (개인별 고정)  <-- 추가
+# ✅ "예정등급(현재)" 전용 플러스 건수 (개인별 고정)
 PLANNEDPLUS_FILE = "plannedplus_overrides.json"  # key: "normname|login4" -> int (ex 20)
+
+# ✅ 출석체크 기록 파일 (개인별/기간별)
+ATTENDANCE_FILE = "attendance_log.json"  # key: login_key -> {period_start, period_end, days:[YYYY-MM-DD...]}
+
+# ✅ 출석 1회당 플러스
+ATTENDANCE_BONUS_PER_DAY = 5
+ATTENDANCE_MIN_TODAY_COMPLETE = 6
 
 # ✅ PCX 이벤트 누적 집계 시작일 (고정)
 PCX_START_DATE = date(2025, 11, 26)
@@ -63,6 +71,7 @@ _override_lock = threading.Lock()
 _login4_lock = threading.Lock()
 _prevplus_lock = threading.Lock()
 _plannedplus_lock = threading.Lock()
+_att_lock = threading.Lock()
 
 _rate_bucket: Dict[str, List[float]] = {}
 
@@ -71,10 +80,12 @@ STORE_DIR = Path(os.getenv("STORE_DIR", "."))
 STORE_DIR.mkdir(parents=True, exist_ok=True)
 RIDERS_STORE = STORE_DIR / "store_riders.json"
 STATUS_STORE = STORE_DIR / "store_status.json"
+DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"  # ✅ 배달현황 저장
 
 # 메모리 캐시
 _riders_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _status_cache: Dict[str, Any] = {}  # key: "from_to" -> {"ts":..., "data":...}
+_delivery_status_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 app = FastAPI(title="라웰 등급 조회 (Collector Ingest)")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
@@ -404,6 +415,136 @@ def clear_plannedplus(login_key: str) -> None:
 
 
 # -----------------------------
+# ✅ Attendance log
+# -----------------------------
+def load_attendance_map() -> Dict[str, Any]:
+    with _att_lock:
+        if not os.path.exists(ATTENDANCE_FILE):
+            return {}
+        try:
+            with open(ATTENDANCE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+
+def save_attendance_map(data: Dict[str, Any]) -> None:
+    with _att_lock:
+        with open(ATTENDANCE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _att_get_record(att_map: Dict[str, Any], login_key: str) -> Dict[str, Any]:
+    rec = att_map.get(login_key)
+    if isinstance(rec, dict):
+        return rec
+    return {"period_start": "", "period_end": "", "days": []}
+
+
+def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl: date) -> Tuple[int, int, bool]:
+    """
+    기간이 바뀌었으면:
+      - 이전기간 출석횟수 * 5를 prevplus에 합산
+      - plannedplus에서 출석분(이전기간)을 빼는 작업은 하지 않음(기간이 바뀌면 plannedplus는 새기간으로 다시 쌓이게)
+      - attendance 기록 초기화
+    return: (rolled_bonus, prevplus_after, rolled)
+    """
+    att_map = load_attendance_map()
+    rec = _att_get_record(att_map, login_key)
+
+    rec_ps = safe_date_parse(rec.get("period_start", ""))
+    rec_pe = safe_date_parse(rec.get("period_end", ""))
+
+    cur_ps = cur_start
+    cur_pe = cur_end_incl
+
+    # 기록이 없으면 현재기간으로 초기화
+    if rec_ps is None or rec_pe is None or not rec.get("period_start"):
+        rec["period_start"] = cur_ps.isoformat()
+        rec["period_end"] = cur_pe.isoformat()
+        rec["days"] = list(dict.fromkeys(rec.get("days") or []))
+        att_map[login_key] = rec
+        save_attendance_map(att_map)
+        return 0, get_prevplus(login_key), False
+
+    # 기간 동일이면 롤오버 없음
+    if rec_ps == cur_ps and rec_pe == cur_pe:
+        return 0, get_prevplus(login_key), False
+
+    # ✅ 기간이 바뀜 → 이전기간 출석 보너스 이관
+    days = rec.get("days") or []
+    if not isinstance(days, list):
+        days = []
+    days = [d for d in days if isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)]
+
+    bonus = len(set(days)) * ATTENDANCE_BONUS_PER_DAY
+    if bonus:
+        prevplus_now = get_prevplus(login_key)
+        set_prevplus(login_key, prevplus_now + bonus)
+
+    # 새 기간으로 초기화
+    rec["period_start"] = cur_ps.isoformat()
+    rec["period_end"] = cur_pe.isoformat()
+    rec["days"] = []
+    att_map[login_key] = rec
+    save_attendance_map(att_map)
+
+    return bonus, get_prevplus(login_key), True
+
+
+def attendance_is_checked_today(login_key: str, today: date, cur_start: date, cur_end_incl: date) -> bool:
+    att_map = load_attendance_map()
+    rec = _att_get_record(att_map, login_key)
+    if rec.get("period_start") != cur_start.isoformat() or rec.get("period_end") != cur_end_incl.isoformat():
+        return False
+    days = rec.get("days") or []
+    if not isinstance(days, list):
+        return False
+    return today.isoformat() in set([d for d in days if isinstance(d, str)])
+
+
+def attendance_mark_today(login_key: str, today: date, cur_start: date, cur_end_incl: date) -> bool:
+    """
+    오늘 출석 체크 기록 (중복 방지)
+    """
+    att_map = load_attendance_map()
+    rec = _att_get_record(att_map, login_key)
+
+    # 기간 다르면 강제 초기화
+    if rec.get("period_start") != cur_start.isoformat() or rec.get("period_end") != cur_end_incl.isoformat():
+        rec["period_start"] = cur_start.isoformat()
+        rec["period_end"] = cur_end_incl.isoformat()
+        rec["days"] = []
+
+    days = rec.get("days") or []
+    if not isinstance(days, list):
+        days = []
+    days_set = set([d for d in days if isinstance(d, str)])
+
+    if today.isoformat() in days_set:
+        return False
+
+    days.append(today.isoformat())
+    rec["days"] = list(dict.fromkeys(days))
+    att_map[login_key] = rec
+    save_attendance_map(att_map)
+    return True
+
+
+def attendance_count_in_period(login_key: str, cur_start: date, cur_end_incl: date) -> int:
+    att_map = load_attendance_map()
+    rec = _att_get_record(att_map, login_key)
+    if rec.get("period_start") != cur_start.isoformat() or rec.get("period_end") != cur_end_incl.isoformat():
+        return 0
+    days = rec.get("days") or []
+    if not isinstance(days, list):
+        return 0
+    days = [d for d in days if isinstance(d, str)]
+    return len(set(days))
+
+
+# -----------------------------
 # Store helpers
 # -----------------------------
 def _read_json(path: Path, default):
@@ -473,6 +614,21 @@ def has_status_range(from_d: date, to_d: date) -> bool:
     return isinstance(all_status, dict) and (key in all_status)
 
 
+def fetch_delivery_status_cached() -> Dict[str, Any]:
+    now = time.time()
+    if _delivery_status_cache["data"] is not None and now - _delivery_status_cache["ts"] <= DELIVERY_STATUS_CACHE_TTL:
+        return _delivery_status_cache["data"]
+
+    st = _read_json(DELIVERY_STATUS_STORE, {"data": {}, "ts": 0})
+    data = st.get("data") if isinstance(st, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    _delivery_status_cache["ts"] = now
+    _delivery_status_cache["data"] = data
+    return data
+
+
 def store_ready() -> bool:
     st = _read_json(RIDERS_STORE, {})
     riders = st.get("riders") if isinstance(st, dict) else None
@@ -522,6 +678,23 @@ async def ingest_riders(request: Request):
     _riders_cache["ts"] = 0.0
     _riders_cache["data"] = None
     return {"ok": True, "count": len(riders)}
+
+
+@app.post("/ingest/delivery-status")
+async def ingest_delivery_status(request: Request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    payload = await request.json()
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
+
+    _write_json(DELIVERY_STATUS_STORE, {"ts": time.time(), "data": data})
+    _delivery_status_cache["ts"] = 0.0
+    _delivery_status_cache["data"] = None
+    return {"ok": True}
 
 
 @app.get("/ingest/ranges")
@@ -627,7 +800,8 @@ def home():
       </div>
 
       <div style="color:#888; margin-top:12px; font-size:13px;">
-        * 완료건수는 ‘어제까지’ 반영됩니다.
+        * 완료건수는 ‘어제까지’ 반영됩니다. (등급용)<br/>
+        * 출석체크는 ‘오늘 완료건수’ 기준입니다. (실시간)
       </div>
     </div>
     """
@@ -667,6 +841,84 @@ def admin_help():
     </div>
     """
     return html_page("관리자", body)
+
+
+@app.post("/attendance-check")
+def attendance_check(request: Request, name: str = Form(...), login4: str = Form(...)):
+    """
+    출석체크 클릭 처리:
+      - 오늘완료 >= 6 조건 충족 시에만
+      - 1일 1회
+      - 성공하면 plannedplus +5
+    """
+    if not store_ready():
+        return not_ready_page()
+
+    ip = request.client.host if request.client else "unknown"
+    if not rate_limit(ip):
+        return RedirectResponse("/", status_code=303)
+
+    name_in = norm_name(name)
+    login4 = (login4 or "").strip()
+
+    if not re.fullmatch(r"\d{4}", login4):
+        return RedirectResponse("/", status_code=303)
+
+    riders = fetch_riders_cached()
+    candidates = [r for r in riders if norm_name(r.get("name", "")) == name_in]
+    matches: List[Dict[str, Any]] = []
+    for r in candidates:
+        l4, _, _ = get_login4_for_rider(r)
+        if l4 == login4:
+            matches.append(r)
+
+    if len(matches) != 1:
+        return RedirectResponse("/", status_code=303)
+
+    rider = matches[0]
+    rider_login4, rider_real4, _ = get_login4_for_rider(rider)
+    eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
+
+    today = date.today()
+    cur_start, cur_end_incl = current_period(eff_join_date, today)
+
+    login_key = f"{name_in}|{rider_login4}"
+
+    # 기간 롤오버 (필요하면 자동 이관)
+    attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
+
+    # 오늘 완료건수 (delivery-status 기준)
+    ds = fetch_delivery_status_cached()
+    today_completed = 0
+    rows = ds.get("data") or []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            nm = norm_name(row.get("name") or "")
+            ph = (row.get("phoneNumber") or "").replace(" ", "")
+            real4 = last4_from_phone(ph)
+            if nm == name_in and real4 == rider_real4:
+                cnt = (row.get("deliveryAcceptanceCount") or {}).get("complete") or 0
+                today_completed = int(cnt)
+                break
+
+    if today_completed < ATTENDANCE_MIN_TODAY_COMPLETE:
+        return RedirectResponse("/", status_code=303)
+
+    if attendance_is_checked_today(login_key, today, cur_start, cur_end_incl):
+        return RedirectResponse("/", status_code=303)
+
+    # 출석 기록
+    ok = attendance_mark_today(login_key, today, cur_start, cur_end_incl)
+    if not ok:
+        return RedirectResponse("/", status_code=303)
+
+    # ✅ plannedplus +5
+    planned_plus = get_plannedplus(login_key)
+    set_plannedplus(login_key, planned_plus + ATTENDANCE_BONUS_PER_DAY)
+
+    return RedirectResponse("/", status_code=303)
 
 
 @app.post("/check", response_class=HTMLResponse)
@@ -753,19 +1005,48 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     login_key = f"{name_in}|{rider_login4}"
     prev_plus = get_prevplus(login_key)
 
-    # ✅ 예정등급(현재기간) 전용 플러스  <-- 추가
+    # ✅ 예정등급(현재기간) 전용 플러스
     planned_plus = get_plannedplus(login_key)
 
+    # ✅ 출석 기간 롤오버(자동 이관)
+    rolled_bonus, prevplus_after, rolled = attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
+    if rolled:
+        prev_plus = prevplus_after
+
+    # ✅ 실시간(금일) 완료건수/운행상태 (delivery-status)
+    today_completed = 0
+    today_status_desc = "-"
+    ds = fetch_delivery_status_cached()
+    rows = ds.get("data") or []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            nm = norm_name(row.get("name") or "")
+            ph = (row.get("phoneNumber") or "").replace(" ", "")
+            real4 = last4_from_phone(ph)
+            if nm == name_in and real4 == rider_real4:
+                cnt = (row.get("deliveryAcceptanceCount") or {}).get("complete") or 0
+                today_completed = int(cnt)
+                st = row.get("status") or {}
+                today_status_desc = (st.get("desc") or "-")
+                break
+
+    # ✅ 출석 상태
+    att_count = attendance_count_in_period(login_key, cur_start, cur_end_incl)
+    att_checked_today = attendance_is_checked_today(login_key, today, cur_start, cur_end_incl)
+
+    # ✅ 버튼 활성화 조건: "오늘완료 >= 6" AND "오늘 아직 미체크"
+    attendance_enabled = (today_completed >= ATTENDANCE_MIN_TODAY_COMPLETE) and (not att_checked_today)
+
     # 등급 계산:
-    # - 예정등급(현재기간) = "현재기간 완료건수 + planned_plus"
-    # - 현재등급(이전기간) = "이전기간 완료건수 + prev_plus"
     planned_total = cur_completed_raw + planned_plus
     prev_total = prev_completed_raw + prev_plus
 
     planned_grade = grade_from_total(planned_total)
     current_grade = grade_from_total(prev_total)
 
-    # 다음등급/남은건수는 "현재기간 완료건수" 기준(요청대로 유지)
+    # 다음등급/남은건수는 "현재기간 완료건수" 기준
     nxt, remain = next_grade_target(cur_completed_raw)
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
@@ -777,6 +1058,10 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     if pcx_from <= pcx_to and has_status_range(pcx_from, pcx_to):
         cmap_pcx = fetch_status_complete_map_cached(pcx_from, pcx_to)
         pcx_text = f"{int(cmap_pcx.get(api_key, 0))}건"
+
+    rollover_note = ""
+    if rolled_bonus:
+        rollover_note = f"<div style='margin-top:8px;color:#111;font-size:13px;'><b>출석 이관:</b> 이전기간 출석보너스 {rolled_bonus}건이 현재등급(이전) 플러스에 자동 합산되었습니다.</div>"
 
     body = f"""
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:860px; margin:0 auto;">
@@ -814,10 +1099,42 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
       </div>
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
-        <div style="color:#666;">
-          다음등급: <b>{(nxt or '-')}</b> / 남은건수: <b>{(remain if remain is not None else '-')}</b>
+        <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+          <div style="color:#666;">
+            다음등급: <b>{(nxt or '-')}</b> / 남은건수: <b>{(remain if remain is not None else '-')}</b>
+            <div style="color:#999; font-size:12px; margin-top:6px;">* 다음등급/남은건수는 “현재기간 완료건수(어제까지)” 기준입니다.</div>
+          </div>
+          <div style="color:#111; font-weight:900;">
+            오늘완료(실시간): {today_completed}건
+            <div style="color:#777; font-weight:600; font-size:12px; margin-top:4px;">운행상태: {today_status_desc}</div>
+          </div>
         </div>
-        <div style="color:#999; font-size:12px; margin-top:6px;">* 다음등급/남은건수는 “현재기간 완료건수” 기준입니다.</div>
+
+        <div style="margin-top:10px; border-top:1px dashed #eee; padding-top:10px;">
+          <div style="font-weight:900; margin-bottom:6px;">출석체크</div>
+          <div style="color:#666; font-size:13px; line-height:1.6;">
+            - 조건: <b>오늘 완료 {ATTENDANCE_MIN_TODAY_COMPLETE}건 이상</b>이면 출석체크 가능 (운행중/운행종료 무관)<br/>
+            - 출석 1회당 <b>+{ATTENDANCE_BONUS_PER_DAY}건</b> (예정등급에 즉시 반영)<br/>
+            - 기간 종료 시 출석보너스는 <b>현재등급(이전) 플러스</b>로 자동 이관 후 초기화
+          </div>
+
+          <div style="margin-top:10px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <div style="color:#111; font-weight:900;">이번기간 출석: {att_count}회 (보너스 {att_count * ATTENDANCE_BONUS_PER_DAY}건)</div>
+            <form method="post" action="/attendance-check" style="margin:0;">
+              <input type="hidden" name="name" value="{name}" />
+              <input type="hidden" name="login4" value="{login4}" />
+              <button type="submit"
+                {'disabled' if not attendance_enabled else ''}
+                style="padding:10px 14px; border:none; border-radius:12px; background:{'#111' if attendance_enabled else '#bbb'}; color:#fff; font-weight:900; cursor:{'pointer' if attendance_enabled else 'not-allowed'};">
+                {'오늘 출석체크 완료' if att_checked_today else '출석체크 (+5)'}
+              </button>
+            </form>
+            <div style="color:#999; font-size:12px;">
+              {'' if attendance_enabled else ('오늘완료가 부족합니다' if today_completed < ATTENDANCE_MIN_TODAY_COMPLETE else '이미 오늘 출석체크 완료')}
+            </div>
+          </div>
+          {rollover_note}
+        </div>
       </div>
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
@@ -987,7 +1304,6 @@ def admin_clear_prevplus(request: Request, key: str = Form(...), redirect_q: str
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
 
-# ✅ 예정등급(현재) 플러스 set/clear  <-- 추가
 @app.post("/admin/set-plannedplus")
 def admin_set_plannedplus(request: Request, key: str = Form(...), plannedplus: str = Form(...), redirect_q: str = Form(default="")):
     r = require_admin(request)
@@ -1039,7 +1355,7 @@ def dashboard(request: Request, q: str = ""):
     riders = fetch_riders_cached()
     join_overrides = load_overrides()
     prevplus_map = load_prevplus_map()
-    plannedplus_map = load_plannedplus_map()  # <-- 추가
+    plannedplus_map = load_plannedplus_map()
     qn = norm_name(q)
 
     rider_rows = []
@@ -1369,7 +1685,7 @@ def dashboard_excel(request: Request):
 
     riders = fetch_riders_cached()
     prevplus_map = load_prevplus_map()
-    plannedplus_map = load_plannedplus_map()  # <-- 추가
+    plannedplus_map = load_plannedplus_map()
 
     today = date.today()
 
@@ -1507,6 +1823,7 @@ def health():
     riders_ok = store_ready()
     riders_ts = _read_json(RIDERS_STORE, {}).get("ts")
     status_keys = list((_read_json(STATUS_STORE, {}) or {}).keys())[:5]
+    delivery_ts = _read_json(DELIVERY_STATUS_STORE, {}).get("ts")
 
     pcx_from = PCX_START_DATE
     pcx_to = date.today() - timedelta(days=1)
@@ -1518,6 +1835,7 @@ def health():
       <div>ingest_token_set: <b>{ok_token}</b></div>
       <div>riders_uploaded: <b>{riders_ok}</b></div>
       <div>riders_ts: <b>{riders_ts}</b></div>
+      <div>delivery_status_ts: <b>{delivery_ts}</b></div>
       <div style="margin-top:8px;">status_keys(sample): <b>{status_keys}</b></div>
       <div style="margin-top:8px;">pcx_range_ready({PCX_START_DATE.isoformat()}~어제): <b>{pcx_ready}</b></div>
       <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 홈</a></div>

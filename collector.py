@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
-import os, time
+
+import os
+import time
 import requests
 from datetime import date, timedelta
 from playwright.sync_api import sync_playwright
@@ -10,7 +12,6 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 CENTER_ID = os.getenv("BAEMIN_CENTER_ID", "").strip()
 STATE_FILE = os.getenv("BAEMIN_STATE_FILE", "storage_state.json").strip().strip('"')
 CUM_START_DATE = os.getenv("CUM_START_DATE", "2025-11-26").strip()
-
 
 BASE_API = "https://api-deliverycenter.baemin.com"
 
@@ -30,7 +31,6 @@ def get_ranges():
     return r.json()
 
 def _pw_headers():
-    # 브라우저에서 보던 것과 최대한 유사하게
     return {
         "accept": "application/json, text/plain, */*",
         "origin": "https://deliverycenter.baemin.com",
@@ -45,7 +45,6 @@ def _pw_headers():
     }
 
 def fetch_riders_via_playwright(context):
-    # ✅ 중요: response를 밖으로 들고 나가지 말고 여기서 json()까지 완료
     url = f"{BASE_API}/rider"
     params = {"name":"","userId":"","phoneNumber":"","accountStatus":"","orderName":"","orderBy":""}
     resp = context.request.get(url, params=params, headers=_pw_headers(), timeout=30_000)
@@ -54,8 +53,7 @@ def fetch_riders_via_playwright(context):
     if status >= 400:
         head = resp.text()[:800]
         raise RuntimeError(f"RIDERS_HTTP_{status} CT={ct} HEAD={head}")
-    j = resp.json()
-    return j
+    return resp.json()
 
 def fetch_status_range_via_playwright(context, fromDate: str, toDate: str):
     complete = {}
@@ -93,6 +91,29 @@ def fetch_status_range_via_playwright(context, fromDate: str, toDate: str):
 
     return complete
 
+def fetch_delivery_status_via_playwright(context):
+    """
+    ✅ 실시간 배달현황(금일): 운행상태/금일완료/거절/취소 등
+    """
+    url = f"{BASE_API}/management/delivery-status"
+    params = {
+        "page": 0,
+        "size": 100,
+        "orderName": "riderStatus",
+        "orderBy": "asc",
+        "name": "",
+        "userId": "",
+        "phoneNumber": "",
+        "riderStatus": "",
+    }
+    resp = context.request.get(url, params=params, headers=_pw_headers(), timeout=30_000)
+    status = resp.status
+    ct = resp.headers.get("content-type","")
+    if status >= 400:
+        head = resp.text()[:800]
+        raise RuntimeError(f"DELIVERY_STATUS_HTTP_{status} CT={ct} HEAD={head}")
+    return resp.json()
+
 def normalize_riders(j):
     if isinstance(j, list):
         return j
@@ -119,6 +140,10 @@ def main_loop():
                 riders_list = normalize_riders(riders_j)
                 post_json("/ingest/riders", {"riders": riders_list})
 
+                # 1.5) delivery-status (실시간 배달현황)
+                ds_j = fetch_delivery_status_via_playwright(context)
+                post_json("/ingest/delivery-status", {"data": ds_j})
+
                 # 2) ranges
                 ranges_resp = get_ranges()
                 if ranges_resp.get("ok"):
@@ -131,16 +156,10 @@ def main_loop():
                 cum_to = (date.today() - timedelta(days=1)).isoformat()
 
                 if cum_from <= cum_to:
-                    if not any(
-                        r.get("fromDate") == cum_from and r.get("toDate") == cum_to
-                        for r in ranges
-                    ):
-                        ranges.append({
-                            "fromDate": cum_from,
-                            "toDate": cum_to
-                        })
+                    if not any(r.get("fromDate") == cum_from and r.get("toDate") == cum_to for r in ranges):
+                        ranges.append({"fromDate": cum_from, "toDate": cum_to})
 
-                # status 수집
+                # 3) status 수집
                 for rg in ranges:
                     fd = rg["fromDate"]
                     td = rg["toDate"]
