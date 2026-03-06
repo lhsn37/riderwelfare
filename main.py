@@ -1121,7 +1121,9 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
 
     planned_grade = grade_from_total(planned_total)
     current_grade = grade_from_total(prev_total)
-    nxt, remain = next_grade_target(cur_completed_raw)
+
+    # 다음등급/남은건수도 예정등급 계산 기준과 동일하게
+    nxt, remain = next_grade_target(planned_total)
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
