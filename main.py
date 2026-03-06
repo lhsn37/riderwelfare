@@ -1779,7 +1779,12 @@ def dashboard(request: Request, q: str = ""):
             <div style="font-size:12px; color:{it['today_ratio_fg']}; font-weight:900; margin-top:4px;">{it['today_ratio']}%</div>
           </td>
 
-          <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; font-weight:900;">{it['cur_completed_raw']}</td>
+          <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+              <div style="font-weight:900; font-size:20px;">{it['cur_completed_raw'] + it['planned_plus']}</div>
+              <div style="font-size:12px; color:#999; margin-top:4px;">
+                  현재 {it['cur_completed_raw']} + 플러스 {it['planned_plus']}
+              </div>
+          </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
             <div style="font-weight:900;">{it['current_grade']}</div>
