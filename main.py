@@ -1,16 +1,11 @@
-# main.py (Render 조회용: PC Collector가 업로드한 데이터만 사용)
+# main.py
 # ------------------------------------------------------------------------------------
-# 구조
-# - PC(collector.py): 배민 API 호출(쿠키/센터ID는 PC에만) → Render로 업로드
-# - Render(main.py): 업로드된 riders/status/delivery-status JSON만 읽어서 /check /dashboard 제공
-#
-# Render 환경변수(필수)
-# - INGEST_TOKEN : 업로드 인증 토큰(긴 문자열)
-# - SESSION_SECRET : (선택) 관리자 세션키
-# - ADMIN_PASSWORD : (선택) 관리자 비번(기본 0315)
-# - STORE_DIR : (선택) 저장 폴더(기본 현재 디렉토리). Render Disk 붙이면 그 경로로 지정 추천.
-#
-# ⚠️ Render에는 BAEMIN_COOKIE, BAEMIN_CENTER_ID 필요 없음(지워도 됨)
+# Render 조회용: PC Collector가 업로드한 데이터만 사용
+# 추가 기능:
+# - 개인 조회: 오늘 완료 / 거절 / 취소 / 거절+취소율 표시
+# - 관리자 대시보드: 이름 옆 거절+취소율 배지 표시
+# - 이전등급 플러스 / 예정등급 플러스 엑셀 백업 다운로드
+# - 기존 dashboard.xlsx 또는 plus-backup.xlsx 업로드 시 prev_plus / planned_plus 자동 복원
 # ------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,9 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil.relativedelta import relativedelta
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from openpyxl import Workbook
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import StreamingResponse
@@ -38,7 +33,7 @@ from starlette.responses import StreamingResponse
 # -----------------------------
 RIDERS_CACHE_TTL = 10
 STATUS_CACHE_TTL = 10
-DELIVERY_STATUS_CACHE_TTL = 5  # ✅ 배달현황 캐시 (실시간)
+DELIVERY_STATUS_CACHE_TTL = 5
 
 RATE_WINDOW_SEC = 60
 RATE_MAX_REQ = 30
@@ -47,23 +42,15 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "0315")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "rider-welfare-admin-secret")
 INGEST_TOKEN = (os.getenv("INGEST_TOKEN") or "").strip()
 
-OVERRIDE_FILE = "join_overrides.json"  # key: "normname|login4" -> "YYYY-MM-DD"
-LOGIN4_FILE = "login4_overrides.json"  # key: "normname|real4"  -> "login4"
+OVERRIDE_FILE = "join_overrides.json"            # key: "normname|login4" -> "YYYY-MM-DD"
+LOGIN4_FILE = "login4_overrides.json"            # key: "normname|real4"  -> "login4"
+PREVPLUS_FILE = "prevplus_overrides.json"        # key: "normname|login4" -> int
+PLANNEDPLUS_FILE = "plannedplus_overrides.json"  # key: "normname|login4" -> int
+ATTENDANCE_FILE = "attendance_log.json"          # key: login_key -> {period_start, period_end, days:[YYYY-MM-DD...]}
 
-# ✅ "현재등급(이전)" 전용 플러스 건수 (개인별 고정)
-PREVPLUS_FILE = "prevplus_overrides.json"  # key: "normname|login4" -> int (ex 20)
-
-# ✅ "예정등급(현재)" 전용 플러스 건수 (개인별 고정)
-PLANNEDPLUS_FILE = "plannedplus_overrides.json"  # key: "normname|login4" -> int (ex 20)
-
-# ✅ 출석체크 기록 파일 (개인별/기간별)
-ATTENDANCE_FILE = "attendance_log.json"  # key: login_key -> {period_start, period_end, days:[YYYY-MM-DD...]}
-
-# ✅ 출석 1회당 플러스
 ATTENDANCE_BONUS_PER_DAY = 5
 ATTENDANCE_MIN_TODAY_COMPLETE = 6
 
-# ✅ PCX 이벤트 누적 집계 시작일 (고정)
 PCX_START_DATE = date(2025, 11, 26)
 PCX_LABEL = "25.11.26 ~ (어제)"
 
@@ -80,11 +67,11 @@ STORE_DIR = Path(os.getenv("STORE_DIR", "."))
 STORE_DIR.mkdir(parents=True, exist_ok=True)
 RIDERS_STORE = STORE_DIR / "store_riders.json"
 STATUS_STORE = STORE_DIR / "store_status.json"
-DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"  # ✅ 배달현황 저장
+DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"
 
 # 메모리 캐시
 _riders_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
-_status_cache: Dict[str, Any] = {}  # key: "from_to" -> {"ts":..., "data":...}
+_status_cache: Dict[str, Any] = {}
 _delivery_status_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 app = FastAPI(title="라웰 등급 조회 (Collector Ingest)")
@@ -103,7 +90,7 @@ def html_page(title: str, body: str) -> str:
   <title>{title}</title>
 </head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; padding:16px; background:#fafafa;">
-  <div style="max-width:1200px; margin:0 auto;">
+  <div style="max-width:1400px; margin:0 auto;">
     {body}
   </div>
 </body>
@@ -151,12 +138,84 @@ def safe_date_parse(s: str) -> Optional[date]:
 def is_ended_contract(rider: Dict[str, Any]) -> bool:
     st = rider.get("accountStatus") or {}
     code = (st.get("code") or "").upper()
-    desc = (st.get("desc") or "")
+    desc = st.get("desc") or ""
     if "END" in code or "TERMIN" in code or "EXPIRE" in code:
         return True
     if "계약" in desc and "종료" in desc:
         return True
     return False
+
+
+# -----------------------------
+# Ratio helpers
+# -----------------------------
+def calc_bad_ratio(complete: int, reject: int, cancel: int) -> Dict[str, Any]:
+    complete = int(complete or 0)
+    reject = int(reject or 0)
+    cancel = int(cancel or 0)
+
+    total = complete + reject + cancel
+    bad = reject + cancel
+
+    if total > 0:
+        ratio = round((bad / total) * 100, 1)
+    else:
+        ratio = 0.0
+
+    if ratio <= 19:
+        fg = "#15803d"
+        bg = "#e8f7ee"
+        label = "양호"
+    elif ratio < 30:
+        fg = "#a16207"
+        bg = "#fff8db"
+        label = "주의"
+    else:
+        fg = "#b91c1c"
+        bg = "#fdecec"
+        label = "위험"
+
+    return {
+        "total": total,
+        "bad": bad,
+        "ratio": ratio,
+        "fg": fg,
+        "bg": bg,
+        "label": label,
+    }
+
+
+def build_today_stats_map(ds: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    rows = ds.get("data") or []
+    if not isinstance(rows, list):
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        nm = norm_name(row.get("name") or "")
+        ph = (row.get("phoneNumber") or "").replace(" ", "")
+        real4 = last4_from_phone(ph)
+        if not nm or not real4:
+            continue
+
+        dac = row.get("deliveryAcceptanceCount") or {}
+        complete = int(dac.get("complete") or 0)
+        reject = int(dac.get("reject") or 0)
+        cancel = int(dac.get("cancel") or 0)
+        ratio_info = calc_bad_ratio(complete, reject, cancel)
+
+        st = row.get("status") or {}
+        out[f"{nm}|{real4}"] = {
+            "complete": complete,
+            "reject": reject,
+            "cancel": cancel,
+            "status_desc": st.get("desc") or "-",
+            **ratio_info,
+        }
+
+    return out
 
 
 # -----------------------------
@@ -194,7 +253,7 @@ def next_grade_target(total: int) -> Tuple[Optional[str], Optional[int]]:
 
 
 # -----------------------------
-# Period logic (join day based) - "마감일 포함"
+# Period logic
 # -----------------------------
 def clamp_day(year: int, month: int, target_day: int) -> date:
     first = date(year, month, 1)
@@ -203,10 +262,6 @@ def clamp_day(year: int, month: int, target_day: int) -> date:
 
 
 def current_period(join_date: date, today: date) -> Tuple[date, date]:
-    """
-    정책기간: 시작일(입사일 day 앵커) ~ 다음달 같은 day의 '전날' (마감일 포함)
-    예) 2/11 시작이면 3/10까지가 마감(포함)
-    """
     join_day = join_date.day
     this_anchor = clamp_day(today.year, today.month, join_day)
 
@@ -233,7 +288,7 @@ def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
 
 
 # -----------------------------
-# Join-date override (persistent) keyed by (name|login4)
+# Join-date override
 # -----------------------------
 def load_overrides() -> Dict[str, str]:
     with _override_lock:
@@ -254,7 +309,7 @@ def save_overrides(data: Dict[str, str]) -> None:
 
 
 # -----------------------------
-# Login4 override (persistent)
+# Login4 override
 # -----------------------------
 def load_login4_map() -> Dict[str, str]:
     with _login4_lock:
@@ -323,7 +378,7 @@ def get_effective_join_date_by_login_key(rider: Dict[str, Any], login4: str) -> 
 
 
 # -----------------------------
-# ✅ PrevPlus override (persistent) : "현재등급(이전) 전용 +건수"
+# PrevPlus override
 # -----------------------------
 def load_prevplus_map() -> Dict[str, int]:
     with _prevplus_lock:
@@ -351,8 +406,7 @@ def save_prevplus_map(data: Dict[str, int]) -> None:
 
 
 def get_prevplus(login_key: str) -> int:
-    m = load_prevplus_map()
-    return int(m.get(login_key, 0) or 0)
+    return int(load_prevplus_map().get(login_key, 0) or 0)
 
 
 def set_prevplus(login_key: str, v: int) -> None:
@@ -369,7 +423,7 @@ def clear_prevplus(login_key: str) -> None:
 
 
 # -----------------------------
-# ✅ PlannedPlus override (persistent) : "예정등급(현재) 전용 +건수"
+# PlannedPlus override
 # -----------------------------
 def load_plannedplus_map() -> Dict[str, int]:
     with _plannedplus_lock:
@@ -397,8 +451,7 @@ def save_plannedplus_map(data: Dict[str, int]) -> None:
 
 
 def get_plannedplus(login_key: str) -> int:
-    m = load_plannedplus_map()
-    return int(m.get(login_key, 0) or 0)
+    return int(load_plannedplus_map().get(login_key, 0) or 0)
 
 
 def set_plannedplus(login_key: str, v: int) -> None:
@@ -415,7 +468,7 @@ def clear_plannedplus(login_key: str) -> None:
 
 
 # -----------------------------
-# ✅ Attendance log
+# Attendance
 # -----------------------------
 def load_attendance_map() -> Dict[str, Any]:
     with _att_lock:
@@ -443,36 +496,23 @@ def _att_get_record(att_map: Dict[str, Any], login_key: str) -> Dict[str, Any]:
 
 
 def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl: date) -> Tuple[int, int, bool]:
-    """
-    기간이 바뀌었으면:
-      - 이전기간 출석횟수 * 5를 prevplus에 합산
-      - plannedplus에서 출석분(이전기간)을 빼는 작업은 하지 않음(기간이 바뀌면 plannedplus는 새기간으로 다시 쌓이게)
-      - attendance 기록 초기화
-    return: (rolled_bonus, prevplus_after, rolled)
-    """
     att_map = load_attendance_map()
     rec = _att_get_record(att_map, login_key)
 
     rec_ps = safe_date_parse(rec.get("period_start", ""))
     rec_pe = safe_date_parse(rec.get("period_end", ""))
 
-    cur_ps = cur_start
-    cur_pe = cur_end_incl
-
-    # 기록이 없으면 현재기간으로 초기화
     if rec_ps is None or rec_pe is None or not rec.get("period_start"):
-        rec["period_start"] = cur_ps.isoformat()
-        rec["period_end"] = cur_pe.isoformat()
+        rec["period_start"] = cur_start.isoformat()
+        rec["period_end"] = cur_end_incl.isoformat()
         rec["days"] = list(dict.fromkeys(rec.get("days") or []))
         att_map[login_key] = rec
         save_attendance_map(att_map)
         return 0, get_prevplus(login_key), False
 
-    # 기간 동일이면 롤오버 없음
-    if rec_ps == cur_ps and rec_pe == cur_pe:
+    if rec_ps == cur_start and rec_pe == cur_end_incl:
         return 0, get_prevplus(login_key), False
 
-    # ✅ 기간이 바뀜 → 이전기간 출석 보너스 이관
     days = rec.get("days") or []
     if not isinstance(days, list):
         days = []
@@ -483,9 +523,8 @@ def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl:
         prevplus_now = get_prevplus(login_key)
         set_prevplus(login_key, prevplus_now + bonus)
 
-    # 새 기간으로 초기화
-    rec["period_start"] = cur_ps.isoformat()
-    rec["period_end"] = cur_pe.isoformat()
+    rec["period_start"] = cur_start.isoformat()
+    rec["period_end"] = cur_end_incl.isoformat()
     rec["days"] = []
     att_map[login_key] = rec
     save_attendance_map(att_map)
@@ -505,13 +544,9 @@ def attendance_is_checked_today(login_key: str, today: date, cur_start: date, cu
 
 
 def attendance_mark_today(login_key: str, today: date, cur_start: date, cur_end_incl: date) -> bool:
-    """
-    오늘 출석 체크 기록 (중복 방지)
-    """
     att_map = load_attendance_map()
     rec = _att_get_record(att_map, login_key)
 
-    # 기간 다르면 강제 초기화
     if rec.get("period_start") != cur_start.isoformat() or rec.get("period_end") != cur_end_incl.isoformat():
         rec["period_start"] = cur_start.isoformat()
         rec["period_end"] = cur_end_incl.isoformat()
@@ -540,8 +575,7 @@ def attendance_count_in_period(login_key: str, cur_start: date, cur_end_incl: da
     days = rec.get("days") or []
     if not isinstance(days, list):
         return 0
-    days = [d for d in days if isinstance(d, str)]
-    return len(set(days))
+    return len(set([d for d in days if isinstance(d, str)]))
 
 
 # -----------------------------
@@ -568,7 +602,7 @@ def _require_ingest(request: Request):
 
 
 # -----------------------------
-# Data access (Render는 업로드된 것만 읽음)
+# Data access
 # -----------------------------
 def fetch_riders_cached() -> List[Dict[str, Any]]:
     now = time.time()
@@ -660,8 +694,74 @@ def require_admin(request: Request) -> Optional[RedirectResponse]:
     return None
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, float) and v != v:
+            return default
+        s = str(v).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+
+def restore_plus_from_workbook(file_bytes: bytes) -> Tuple[int, int]:
+    """
+    지원 컬럼:
+    - name
+    - login4
+    - prev_plus
+    - planned_plus
+    기존 dashboard.xlsx / plus-backup.xlsx 둘 다 복원 가능
+    """
+    wb = load_workbook(BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("업로드된 엑셀에 데이터가 없습니다.")
+
+    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    idx = {h: i for i, h in enumerate(headers)}
+
+    required = ["name", "login4", "prev_plus", "planned_plus"]
+    missing = [k for k in required if k not in idx]
+    if missing:
+        raise ValueError(f"필수 컬럼 없음: {', '.join(missing)}")
+
+    prev_map: Dict[str, int] = {}
+    planned_map: Dict[str, int] = {}
+
+    restored_rows = 0
+    for row in rows[1:]:
+        if row is None:
+            continue
+
+        name = row[idx["name"]] if idx["name"] < len(row) else None
+        login4 = row[idx["login4"]] if idx["login4"] < len(row) else None
+        prev_plus = row[idx["prev_plus"]] if idx["prev_plus"] < len(row) else None
+        planned_plus = row[idx["planned_plus"]] if idx["planned_plus"] < len(row) else None
+
+        name_s = str(name).strip() if name is not None else ""
+        login4_s = str(login4).strip() if login4 is not None else ""
+        if not name_s or not re.fullmatch(r"\d{4}", login4_s):
+            continue
+
+        key = f"{norm_name(name_s)}|{login4_s}"
+        prev_map[key] = _safe_int(prev_plus, 0)
+        planned_map[key] = _safe_int(planned_plus, 0)
+        restored_rows += 1
+
+    save_prevplus_map(prev_map)
+    save_plannedplus_map(planned_map)
+    return restored_rows, len(prev_map)
+
+
 # -----------------------------
-# Ingest endpoints (PC Collector 전용)
+# Ingest endpoints
 # -----------------------------
 @app.post("/ingest/riders")
 async def ingest_riders(request: Request):
@@ -761,7 +861,7 @@ async def ingest_status(request: Request):
 
 
 # -----------------------------
-# Routes
+# Main routes
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -816,14 +916,14 @@ def check_get_redirect():
 @app.get("/admin", response_class=HTMLResponse)
 def admin_help():
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:820px; margin:0 auto;">
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:900px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">관리자</h2>
       <div style="color:#666; margin-bottom:12px;">
         이 서버(Render)는 배민 API를 직접 호출하지 않습니다.<br/>
         PC에서 collector.py가 /ingest 로 데이터를 업로드하면 조회가 됩니다.
       </div>
 
-      <div style="background:#f7f7f7; border-radius:12px; padding:12px; font-size:14px; line-height:1.5;">
+      <div style="background:#f7f7f7; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
         <div><b>Render 설정</b></div>
         <div>- Settings → Environment → <b>INGEST_TOKEN</b> 등록</div>
         <div>- Start Command: <span style="font-family: ui-monospace;">uvicorn main:app --host 0.0.0.0 --port $PORT</span></div>
@@ -833,6 +933,13 @@ def admin_help():
         <div><b>PCX 누적 집계</b></div>
         <div>- 개인조회 화면에 <b>{PCX_LABEL}</b> 누적 완료건수를 보여줍니다.</div>
         <div>- 단, PC에서 그 기간({PCX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
+      </div>
+
+      <div style="margin-top:14px; background:#eef6ff; border:1px solid #cfe3ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
+        <div><b>플러스 백업 / 복원</b></div>
+        <div>- 관리자 대시보드에서 <b>플러스 백업 엑셀</b> 다운로드 가능</div>
+        <div>- 코드 업데이트 후 기존 <b>dashboard.xlsx</b> 또는 <b>plus-backup.xlsx</b> 업로드 시</div>
+        <div>&nbsp;&nbsp;→ <b>이전등급 플러스(prev_plus)</b>, <b>예정등급 플러스(planned_plus)</b> 자동 복원</div>
       </div>
 
       <div style="margin-top:14px;">
@@ -845,12 +952,6 @@ def admin_help():
 
 @app.post("/attendance-check")
 def attendance_check(request: Request, name: str = Form(...), login4: str = Form(...)):
-    """
-    출석체크 클릭 처리:
-      - 오늘완료 >= 6 조건 충족 시에만
-      - 1일 1회
-      - 성공하면 plannedplus +5
-    """
     if not store_ready():
         return not_ready_page()
 
@@ -881,27 +982,13 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
 
     today = date.today()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
-
     login_key = f"{name_in}|{rider_login4}"
 
-    # 기간 롤오버 (필요하면 자동 이관)
     attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
 
-    # 오늘 완료건수 (delivery-status 기준)
     ds = fetch_delivery_status_cached()
-    today_completed = 0
-    rows = ds.get("data") or []
-    if isinstance(rows, list):
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            nm = norm_name(row.get("name") or "")
-            ph = (row.get("phoneNumber") or "").replace(" ", "")
-            real4 = last4_from_phone(ph)
-            if nm == name_in and real4 == rider_real4:
-                cnt = (row.get("deliveryAcceptanceCount") or {}).get("complete") or 0
-                today_completed = int(cnt)
-                break
+    stats_map = build_today_stats_map(ds)
+    today_completed = int((stats_map.get(f"{name_in}|{rider_real4}") or {}).get("complete") or 0)
 
     if today_completed < ATTENDANCE_MIN_TODAY_COMPLETE:
         return RedirectResponse("/", status_code=303)
@@ -909,12 +996,10 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     if attendance_is_checked_today(login_key, today, cur_start, cur_end_incl):
         return RedirectResponse("/", status_code=303)
 
-    # 출석 기록
     ok = attendance_mark_today(login_key, today, cur_start, cur_end_incl)
     if not ok:
         return RedirectResponse("/", status_code=303)
 
-    # ✅ plannedplus +5
     planned_plus = get_plannedplus(login_key)
     set_plannedplus(login_key, planned_plus + ATTENDANCE_BONUS_PER_DAY)
 
@@ -951,11 +1036,10 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
         return html_page("입력 오류", body)
 
     riders = fetch_riders_cached()
-
     candidates = [r for r in riders if norm_name(r.get("name", "")) == name_in]
     matches: List[Dict[str, Any]] = []
     for r in candidates:
-        l4, real4, _ = get_login4_for_rider(r)
+        l4, _, _ = get_login4_for_rider(r)
         if l4 == login4:
             matches.append(r)
 
@@ -985,7 +1069,6 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     eff_join_date, join_src = get_effective_join_date_by_login_key(rider, rider_login4)
 
     today = date.today()
-
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
@@ -1001,57 +1084,47 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     cur_completed_raw = int(cmap_cur.get(api_key, 0))
     prev_completed_raw = int(cmap_prev.get(api_key, 0))
 
-    # ✅ 이전등급(이전기간) 전용 플러스
     login_key = f"{name_in}|{rider_login4}"
     prev_plus = get_prevplus(login_key)
-
-    # ✅ 예정등급(현재기간) 전용 플러스
     planned_plus = get_plannedplus(login_key)
 
-    # ✅ 출석 기간 롤오버(자동 이관)
     rolled_bonus, prevplus_after, rolled = attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
     if rolled:
         prev_plus = prevplus_after
 
-    # ✅ 실시간(금일) 완료건수/운행상태 (delivery-status)
-    today_completed = 0
-    today_status_desc = "-"
     ds = fetch_delivery_status_cached()
-    rows = ds.get("data") or []
-    if isinstance(rows, list):
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            nm = norm_name(row.get("name") or "")
-            ph = (row.get("phoneNumber") or "").replace(" ", "")
-            real4 = last4_from_phone(ph)
-            if nm == name_in and real4 == rider_real4:
-                cnt = (row.get("deliveryAcceptanceCount") or {}).get("complete") or 0
-                today_completed = int(cnt)
-                st = row.get("status") or {}
-                today_status_desc = (st.get("desc") or "-")
-                break
+    today_stats_map = build_today_stats_map(ds)
+    today_info = today_stats_map.get(api_key) or {
+        "complete": 0,
+        "reject": 0,
+        "cancel": 0,
+        "status_desc": "-",
+        **calc_bad_ratio(0, 0, 0),
+    }
 
-    # ✅ 출석 상태
+    today_completed = int(today_info["complete"])
+    today_rejected = int(today_info["reject"])
+    today_canceled = int(today_info["cancel"])
+    today_status_desc = str(today_info["status_desc"])
+    today_total_attempt = int(today_info["total"])
+    today_bad_ratio = float(today_info["ratio"])
+    ratio_bg = str(today_info["bg"])
+    ratio_fg = str(today_info["fg"])
+    ratio_label = str(today_info["label"])
+
     att_count = attendance_count_in_period(login_key, cur_start, cur_end_incl)
     att_checked_today = attendance_is_checked_today(login_key, today, cur_start, cur_end_incl)
-
-    # ✅ 버튼 활성화 조건: "오늘완료 >= 6" AND "오늘 아직 미체크"
     attendance_enabled = (today_completed >= ATTENDANCE_MIN_TODAY_COMPLETE) and (not att_checked_today)
 
-    # 등급 계산:
     planned_total = cur_completed_raw + planned_plus
     prev_total = prev_completed_raw + prev_plus
 
     planned_grade = grade_from_total(planned_total)
     current_grade = grade_from_total(prev_total)
-
-    # 다음등급/남은건수는 "현재기간 완료건수" 기준
     nxt, remain = next_grade_target(cur_completed_raw)
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
-    # ✅ PCX 누적 (25.11.26 ~ 어제)
     pcx_from = PCX_START_DATE
     pcx_to = date.today() - timedelta(days=1)
     pcx_text = "데이터 없음(업로드 필요)"
@@ -1064,7 +1137,7 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
         rollover_note = f"<div style='margin-top:8px;color:#111;font-size:13px;'><b>출석 이관:</b> 이전기간 출석보너스 {rolled_bonus}건이 현재등급(이전) 플러스에 자동 합산되었습니다.</div>"
 
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:860px; margin:0 auto;">
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:920px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">등급 조회 결과</h2>
 
       <div style="color:#888; font-size:13px; margin-top:6px;">
@@ -1099,13 +1172,34 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
       </div>
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
-        <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap;">
           <div style="color:#666;">
             다음등급: <b>{(nxt or '-')}</b> / 남은건수: <b>{(remain if remain is not None else '-')}</b>
             <div style="color:#999; font-size:12px; margin-top:6px;">* 다음등급/남은건수는 “현재기간 완료건수(어제까지)” 기준입니다.</div>
           </div>
-          <div style="color:#111; font-weight:900;">
-            오늘완료(실시간): {today_completed}건
+
+          <div style="color:#111; font-weight:900; min-width:300px;">
+            <div>오늘완료(실시간): {today_completed}건</div>
+            <div style="margin-top:4px; font-size:14px; font-weight:700; color:#666;">
+              거절: {today_rejected}건 / 취소: {today_canceled}건
+            </div>
+            <div style="margin-top:8px;">
+              <span style="
+                display:inline-block;
+                padding:6px 10px;
+                border-radius:999px;
+                background:{ratio_bg};
+                color:{ratio_fg};
+                font-size:13px;
+                font-weight:900;
+                border:1px solid rgba(0,0,0,0.06);
+              ">
+                거절+취소율 {today_bad_ratio}% ({ratio_label})
+              </span>
+            </div>
+            <div style="color:#777; font-weight:600; font-size:12px; margin-top:6px;">
+              운행기준: 완료 {today_completed} + 거절 {today_rejected} + 취소 {today_canceled} = 총 {today_total_attempt}건
+            </div>
             <div style="color:#777; font-weight:600; font-size:12px; margin-top:4px;">운행상태: {today_status_desc}</div>
           </div>
         </div>
@@ -1203,7 +1297,7 @@ def admin_logout(request: Request):
 
 
 # -----------------------------
-# Admin: join/login4/prevplus/plannedplus set/clear
+# Admin set / clear
 # -----------------------------
 @app.post("/admin/set-join")
 def admin_set_join(request: Request, key: str = Form(...), join_date: str = Form(...), redirect_q: str = Form(default="")):
@@ -1275,19 +1369,11 @@ def admin_set_prevplus(request: Request, key: str = Form(...), prevplus: str = F
         return r
 
     key = (key or "").strip()
-    try:
-        v = int((prevplus or "0").strip())
-    except Exception:
-        v = 0
-
+    v = _safe_int(prevplus, 0)
     if not key:
         return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
-    if v < -999:
-        v = -999
-    if v > 999:
-        v = 999
-
+    v = max(-999, min(999, v))
     set_prevplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
@@ -1311,19 +1397,11 @@ def admin_set_plannedplus(request: Request, key: str = Form(...), plannedplus: s
         return r
 
     key = (key or "").strip()
-    try:
-        v = int((plannedplus or "0").strip())
-    except Exception:
-        v = 0
-
+    v = _safe_int(plannedplus, 0)
     if not key:
         return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
-    if v < -999:
-        v = -999
-    if v > 999:
-        v = 999
-
+    v = max(-999, min(999, v))
     set_plannedplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
@@ -1341,7 +1419,111 @@ def admin_clear_plannedplus(request: Request, key: str = Form(...), redirect_q: 
 
 
 # -----------------------------
-# Dashboard (admin only)
+# Plus backup / restore
+# -----------------------------
+@app.get("/plus-backup.xlsx")
+def plus_backup_excel(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+
+    if not store_ready():
+        return not_ready_page()
+
+    riders = fetch_riders_cached()
+    prevplus_map = load_prevplus_map()
+    plannedplus_map = load_plannedplus_map()
+
+    rows = []
+    for rr in riders:
+        name = rr.get("name") or ""
+        if not name:
+            continue
+        login4, real4, _ = get_login4_for_rider(rr)
+        key = f"{norm_name(name)}|{login4}"
+        rows.append({
+            "name": name,
+            "login4": login4,
+            "real4": real4,
+            "prev_plus": int(prevplus_map.get(key, 0) or 0),
+            "planned_plus": int(plannedplus_map.get(key, 0) or 0),
+        })
+
+    rows.sort(key=lambda x: x["name"])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "plus_backup"
+
+    headers = ["name", "login4", "real4", "prev_plus", "planned_plus"]
+    ws.append(headers)
+    for r0 in rows:
+        ws.append([r0.get(h, "") for h in headers])
+
+    for i, h in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = max(14, len(h) + 4)
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    filename = f"riderwelfare_plus_backup_{date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/admin/restore-plus-xlsx")
+async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)):
+    r = require_admin(request)
+    if r:
+        return r
+
+    if not file.filename.lower().endswith(".xlsx"):
+        body = """
+        <div style="max-width:640px; margin:40px auto; background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:20px;">
+          <h3 style="margin-top:0;">업로드 실패</h3>
+          <div style="color:#666;">xlsx 파일만 업로드할 수 있습니다.</div>
+          <div style="margin-top:12px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+        </div>
+        """
+        return HTMLResponse(html_page("업로드 실패", body))
+
+    try:
+        file_bytes = await file.read()
+        restored_rows, saved_count = restore_plus_from_workbook(file_bytes)
+        body = f"""
+        <div style="max-width:720px; margin:40px auto; background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:20px;">
+          <h3 style="margin-top:0;">플러스 복원 완료</h3>
+          <div style="color:#666; line-height:1.7;">
+            업로드 파일: <b>{file.filename}</b><br/>
+            처리 행 수: <b>{restored_rows}</b><br/>
+            저장된 키 수: <b>{saved_count}</b><br/>
+            이전등급 플러스 / 예정등급 플러스가 모두 갱신되었습니다.
+          </div>
+          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+        </div>
+        """
+        return HTMLResponse(html_page("플러스 복원 완료", body))
+    except Exception as e:
+        body = f"""
+        <div style="max-width:720px; margin:40px auto; background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:20px;">
+          <h3 style="margin-top:0;">플러스 복원 실패</h3>
+          <div style="color:#666; line-height:1.7;">
+            파일: <b>{file.filename}</b><br/>
+            오류: <b>{str(e)}</b><br/>
+            업로드 엑셀에 <b>name / login4 / prev_plus / planned_plus</b> 컬럼이 있어야 합니다.
+          </div>
+          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+        </div>
+        """
+        return HTMLResponse(html_page("플러스 복원 실패", body))
+
+
+# -----------------------------
+# Dashboard
 # -----------------------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, q: str = ""):
@@ -1370,11 +1552,11 @@ def dashboard(request: Request, q: str = ""):
         rider_rows.append(rr)
 
     today = date.today()
+    ds = fetch_delivery_status_cached()
+    today_stats_map = build_today_stats_map(ds)
 
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
-
-    computed_rows: List[Dict[str, Any]] = []
 
     for rr in rider_rows:
         nm = rr.get("name") or ""
@@ -1392,7 +1574,8 @@ def dashboard(request: Request, q: str = ""):
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
-        prev_start = cur_start - relativedelta(months=1)
+        prev_m = date(cur_start.year, cur_start.month, 1) + relativedelta(months=-1)
+        prev_start = clamp_day(prev_m.year, prev_m.month, eff_join.day)
         prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
         item = {
@@ -1417,7 +1600,6 @@ def dashboard(request: Request, q: str = ""):
 
         cur_group.setdefault((cur_from, cur_to), []).append(item)
         prev_group.setdefault((prev_from, prev_to), []).append(item)
-        computed_rows.append(item)
 
     prev_completed_map: Dict[str, int] = {}
     for (from_d, to_d), items in prev_group.items():
@@ -1457,6 +1639,14 @@ def dashboard(request: Request, q: str = ""):
             join_badge = "관리자설정" if it["join_src"] == "override" else "배민입사"
             join_badge_color = "#111" if it["join_src"] == "override" else "#888"
 
+            today_info = today_stats_map.get(it["real_key"]) or {
+                "complete": 0,
+                "reject": 0,
+                "cancel": 0,
+                "status_desc": "-",
+                **calc_bad_ratio(0, 0, 0),
+            }
+
             final_rows.append({
                 "name": nm,
                 "created": created_d,
@@ -1482,16 +1672,46 @@ def dashboard(request: Request, q: str = ""):
                 "remain": remain if remain is not None else "-",
                 "login_key": it["login_key"],
                 "name_norm": it["nn"],
+
+                "today_complete": int(today_info["complete"]),
+                "today_reject": int(today_info["reject"]),
+                "today_cancel": int(today_info["cancel"]),
+                "today_total": int(today_info["total"]),
+                "today_ratio": float(today_info["ratio"]),
+                "today_ratio_fg": str(today_info["fg"]),
+                "today_ratio_bg": str(today_info["bg"]),
+                "today_ratio_label": str(today_info["label"]),
+                "today_status_desc": str(today_info["status_desc"]),
             })
 
-    final_rows.sort(key=lambda x: x["cur_completed_raw"], reverse=True)
+    final_rows.sort(key=lambda x: (x["cur_completed_raw"], -x["today_ratio"]), reverse=True)
 
     tr_html = ""
     for i, it in enumerate(final_rows, start=1):
         tr_html += f"""
         <tr>
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">{i}</td>
-          <td style="padding:10px; border-bottom:1px solid #eee; font-weight:900;">{it['name']}</td>
+
+          <td style="padding:10px; border-bottom:1px solid #eee;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <div style="font-weight:900;">{it['name']}</div>
+              <span style="
+                display:inline-block;
+                padding:3px 8px;
+                border-radius:999px;
+                background:{it['today_ratio_bg']};
+                color:{it['today_ratio_fg']};
+                font-size:12px;
+                font-weight:900;
+                border:1px solid rgba(0,0,0,0.06);
+              ">
+                거절+취소 {it['today_ratio']}%
+              </span>
+            </div>
+            <div style="font-size:12px; color:#999; margin-top:4px;">
+              오늘 완료 {it['today_complete']} / 거절 {it['today_reject']} / 취소 {it['today_cancel']}
+            </div>
+          </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; color:#666;">
             배민뒷4: {it['real4']}<br/>
@@ -1551,6 +1771,12 @@ def dashboard(request: Request, q: str = ""):
           <td style="padding:10px; border-bottom:1px solid #eee; color:#666;">
             <div style="font-weight:700;">정책: {it['policy_from']} ~ {it['policy_to']}</div>
             <div style="font-size:12px; color:#999; margin-top:4px;">업로드 반영: {it['api_from']} ~ {it['api_to']}</div>
+          </td>
+
+          <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+            <div style="font-weight:900;">{it['today_complete']}</div>
+            <div style="font-size:12px; color:#999;">거절 {it['today_reject']} / 취소 {it['today_cancel']}</div>
+            <div style="font-size:12px; color:{it['today_ratio_fg']}; font-weight:900; margin-top:4px;">{it['today_ratio']}%</div>
           </td>
 
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; font-weight:900;">{it['cur_completed_raw']}</td>
@@ -1615,43 +1841,62 @@ def dashboard(request: Request, q: str = ""):
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
         <div>
           <h2 style="margin:0 0 6px 0;">전체 등급 현황</h2>
-          <div style="color:#666;">
+          <div style="color:#666; line-height:1.6;">
             - <b>계약종료</b> 라이더는 자동 제외<br/>
+            - <b>오늘운행</b>은 실시간 기준: 완료 / 거절 / 취소 / 거절+취소율 표시<br/>
             - <b>현재등급(이전)</b>은 “이전기간 완료건수 + 플러스(개인별)”로 계산<br/>
-            - <b>예정등급(현재)</b>은 “현재기간 완료건수 + 예정플러스(개인별)”로 계산<br/>
+            - <b>예정등급(현재)</b>은 “현재기간 완료건수 + 예정플러스(개인별)”로 계산
           </div>
           <div style="color:#888; font-size:13px; margin-top:6px;">
-            * 완료건수는 ‘어제까지’ 확정치 기준(업로드 데이터).
+            * 이름 옆 배지는 <b>거절+취소율</b>입니다. 19% 이하 초록 / 20~29.9% 노랑 / 30% 이상 빨강
           </div>
         </div>
 
-        <div style="display:flex; gap:10px; align-items:center;">
-          <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">엑셀 다운로드</a>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">전체 엑셀 다운로드</a>
+          <a href="/plus-backup.xlsx" style="text-decoration:none; color:#111;">플러스 백업 엑셀</a>
           <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
           <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
         </div>
       </div>
 
-      <form method="get" action="/dashboard" style="margin-top:12px; display:flex; gap:8px;">
-        <input name="q" value="{q}"
-               placeholder="이름 또는 배민뒷4 검색 (예: 이정 / 1898)"
-               style="flex:1; font-size:16px; padding:10px 12px; border:1px solid #ddd; border-radius:12px;" />
-        <button type="submit"
-                style="font-size:16px; padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff;">
-          검색
-        </button>
-      </form>
+      <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
+        <form method="get" action="/dashboard" style="display:flex; gap:8px; flex:1 1 480px;">
+          <input name="q" value="{q}"
+                 placeholder="이름 또는 배민뒷4 검색 (예: 이정 / 1898)"
+                 style="flex:1; font-size:16px; padding:10px 12px; border:1px solid #ddd; border-radius:12px;" />
+          <button type="submit"
+                  style="font-size:16px; padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff;">
+            검색
+          </button>
+        </form>
+
+        <form method="post" action="/admin/restore-plus-xlsx" enctype="multipart/form-data"
+              style="display:flex; gap:8px; align-items:center; flex:1 1 420px; background:#f7f9fc; padding:10px 12px; border:1px solid #e4ebf5; border-radius:12px;">
+          <input type="file" name="file" accept=".xlsx"
+                 style="flex:1; font-size:14px;" required />
+          <button type="submit"
+                  style="font-size:14px; padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff;">
+            플러스 복원 업로드
+          </button>
+        </form>
+      </div>
+
+      <div style="margin-top:8px; color:#777; font-size:13px;">
+        * 기존 <b>dashboard.xlsx</b> 또는 <b>플러스 백업 엑셀</b> 업로드 가능 (필수 컬럼: name / login4 / prev_plus / planned_plus)
+      </div>
 
       <div style="margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px;">
-        <table style="border-collapse:collapse; width:100%; min-width:2100px;">
+        <table style="border-collapse:collapse; width:100%; min-width:2350px;">
           <thead>
             <tr style="background:#fafafa;">
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">#</th>
-              <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">이름</th>
+              <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">이름 / 오늘비율</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">로그인 설정</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">배민 입사일</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">기준일(수정가능)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:left;">평가기간</th>
+              <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">오늘운행</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:right;">완료(현재)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">현재등급(이전)</th>
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:center;">예정등급(현재)</th>
@@ -1662,7 +1907,7 @@ def dashboard(request: Request, q: str = ""):
             </tr>
           </thead>
           <tbody>
-            {tr_html if tr_html else '<tr><td colspan="13" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>'}
+            {tr_html if tr_html else '<tr><td colspan="14" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -1672,7 +1917,7 @@ def dashboard(request: Request, q: str = ""):
 
 
 # -----------------------------
-# Excel export (admin only)
+# Excel export
 # -----------------------------
 @app.get("/dashboard.xlsx")
 def dashboard_excel(request: Request):
@@ -1686,13 +1931,11 @@ def dashboard_excel(request: Request):
     riders = fetch_riders_cached()
     prevplus_map = load_prevplus_map()
     plannedplus_map = load_plannedplus_map()
+    today_stats_map = build_today_stats_map(fetch_delivery_status_cached())
 
     today = date.today()
-
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
-
-    items_all: List[Dict[str, Any]] = []
 
     for rr in riders:
         nm = rr.get("name") or ""
@@ -1712,7 +1955,8 @@ def dashboard_excel(request: Request):
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
-        prev_start = cur_start - relativedelta(months=1)
+        prev_m = date(cur_start.year, cur_start.month, 1) + relativedelta(months=-1)
+        prev_start = clamp_day(prev_m.year, prev_m.month, eff_join.day)
         prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
         it = {
@@ -1726,8 +1970,6 @@ def dashboard_excel(request: Request):
             "policy_to": cur_end_incl.isoformat(),
             "api_from": cur_from.isoformat(),
             "api_to": cur_to.isoformat(),
-            "prev_policy_from": prev_start.isoformat(),
-            "prev_policy_to": prev_end_incl.isoformat(),
             "prev_api_from": prev_from.isoformat(),
             "prev_api_to": prev_to.isoformat(),
             "prev_plus": int(prevplus_map.get(login_key, 0) or 0),
@@ -1736,7 +1978,6 @@ def dashboard_excel(request: Request):
 
         cur_group.setdefault((cur_from, cur_to), []).append(it)
         prev_group.setdefault((prev_from, prev_to), []).append(it)
-        items_all.append(it)
 
     prev_completed_map: Dict[str, int] = {}
     for (from_d, to_d), items in prev_group.items():
@@ -1760,6 +2001,13 @@ def dashboard_excel(request: Request):
             current_grade = grade_from_total(prev_total_for_grade)
             nxt, remain = next_grade_target(cur_raw)
 
+            today_info = today_stats_map.get(it["real_key"]) or {
+                "complete": 0,
+                "reject": 0,
+                "cancel": 0,
+                **calc_bad_ratio(0, 0, 0),
+            }
+
             rows.append({
                 "name": it["name"],
                 "login4": it["login4"],
@@ -1769,12 +2017,16 @@ def dashboard_excel(request: Request):
                 "policy_to": it["policy_to"],
                 "api_from": it["api_from"],
                 "api_to": it["api_to"],
+                "today_complete": int(today_info["complete"]),
+                "today_reject": int(today_info["reject"]),
+                "today_cancel": int(today_info["cancel"]),
+                "today_ratio": float(today_info["ratio"]),
                 "cur_completed": cur_raw,
+                "prev_plus": prev_plus,
                 "planned_plus": planned_plus,
                 "planned_total_for_grade": planned_total_for_grade,
                 "planned_grade_cur": planned_grade,
                 "prev_completed": prev_raw,
-                "prev_plus": prev_plus,
                 "prev_total_for_grade": prev_total_for_grade,
                 "current_grade_prev": current_grade,
                 "next": nxt or "",
@@ -1790,17 +2042,19 @@ def dashboard_excel(request: Request):
     headers = [
         "name", "login4", "real4", "join_effective",
         "policy_from", "policy_to", "api_from", "api_to",
+        "today_complete", "today_reject", "today_cancel", "today_ratio",
         "cur_completed",
-        "planned_plus", "planned_total_for_grade", "planned_grade_cur",
-        "prev_completed", "prev_plus", "prev_total_for_grade", "current_grade_prev",
+        "prev_plus", "planned_plus",
+        "planned_total_for_grade", "planned_grade_cur",
+        "prev_completed", "prev_total_for_grade", "current_grade_prev",
         "next", "remain",
     ]
     ws.append(headers)
-    for r in rows:
-        ws.append([r.get(h, "") for h in headers])
+    for r0 in rows:
+        ws.append([r0.get(h, "") for h in headers])
 
     for i, h in enumerate(headers, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = max(12, min(26, len(h) + 4))
+        ws.column_dimensions[get_column_letter(i)].width = max(12, min(28, len(h) + 4))
 
     bio = BytesIO()
     wb.save(bio)
