@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-DB_LOCK = threading.Lock()
+DB_LOCK = threading.RLock()
 
 
 def now_ts() -> int:
