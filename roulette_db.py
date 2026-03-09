@@ -887,6 +887,40 @@ class RouletteDB:
             "backup_name": backup_file.name,
         }
 
+    def save_json_backup_on_disk(self, prefix: str = "roulette_backup") -> Dict[str, Any]:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = self.backup_dir / f"{prefix}_{ts}.json"
+        payload = self.export_json()
+        backup_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "ok": True,
+            "backup_file": str(backup_file),
+            "backup_name": backup_file.name,
+        }
+
+    def ensure_daily_backup(self) -> Dict[str, Any]:
+        today = today_str()
+        with DB_LOCK:
+            last_backup_date = self.get_setting("last_daily_backup_date", "")
+            if last_backup_date == today:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "already_backed_up_today",
+                    "backup_date": today,
+                }
+
+            db_backup = self.create_backup()
+            json_backup = self.save_json_backup_on_disk(prefix="roulette_auto_backup")
+            self.set_setting("last_daily_backup_date", today)
+            return {
+                "ok": True,
+                "skipped": False,
+                "backup_date": today,
+                "db_backup_name": db_backup.get("backup_name", ""),
+                "json_backup_name": json_backup.get("backup_name", ""),
+            }
+
     def get_backup_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
         with DB_LOCK:
             conn = self._connect()
@@ -945,6 +979,9 @@ class RouletteDB:
             "previous_cycle": get_previous_operational_cycle_bounds(),
         }
 
+    def export_all_json(self) -> Dict[str, Any]:
+        return self.export_json()
+
     def export_cycle_json(self, week_key: str) -> Dict[str, Any]:
         return {
             "week_key": week_key,
@@ -975,34 +1012,55 @@ class RouletteDB:
                         str(row.get("value") or ""),
                     ))
 
-            cur.execute("DELETE FROM roulette_rewards")
-            for row in reward_rows:
-                cur.execute("""
-                    INSERT INTO roulette_rewards (amount, weight, active, sort_order)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    int(row.get("amount") or 0),
-                    int(row.get("weight") or 0),
-                    1 if row.get("active") else 0,
-                    int(row.get("sort_order") or 0),
-                ))
+            if reward_rows:
+                cur.execute("DELETE FROM roulette_rewards")
+                for row in reward_rows:
+                    cur.execute("""
+                        INSERT INTO roulette_rewards (amount, weight, active, sort_order)
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        int(row.get("amount") or 0),
+                        int(row.get("weight") or 0),
+                        1 if row.get("active") else 0,
+                        int(row.get("sort_order") or 0),
+                    ))
 
-            cur.execute("DELETE FROM roulette_segment_rewards")
-            for row in segment_rows:
-                cur.execute("""
-                    INSERT INTO roulette_segment_rewards
-                    (segment_value, amount, weight, active, sort_order)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    int(row.get("segment_value") or 0),
-                    int(row.get("amount") or 0),
-                    int(row.get("weight") or 0),
-                    1 if row.get("active") else 0,
-                    int(row.get("sort_order") or 0),
-                ))
+            if segment_rows:
+                cur.execute("DELETE FROM roulette_segment_rewards")
+                for row in segment_rows:
+                    cur.execute("""
+                        INSERT INTO roulette_segment_rewards
+                        (segment_value, amount, weight, active, sort_order)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        int(row.get("segment_value") or 0),
+                        int(row.get("amount") or 0),
+                        int(row.get("weight") or 0),
+                        1 if row.get("active") else 0,
+                        int(row.get("sort_order") or 0),
+                    ))
 
             restored_spins = 0
             for row in spin_rows:
+                spin_date = str(row.get("spin_date") or "")
+                week_key = str(row.get("week_key") or "").strip()
+                if not week_key and spin_date:
+                    try:
+                        d = datetime.strptime(spin_date, "%Y-%m-%d")
+                        week_key = get_operational_cycle_bounds(d.replace(hour=12, minute=0, second=0, microsecond=0))["cycle_key"]
+                    except Exception:
+                        week_key = current_week_key()
+                elif not week_key:
+                    week_key = current_week_key()
+
+                spin_index = int(row.get("spin_index") or 1)
+                eligible_count = int(row.get("eligible_count") or 0)
+                used_count_before = int(row.get("used_count_before") or 0)
+                if eligible_count <= 0:
+                    eligible_count = max(1, spin_index)
+                if used_count_before < 0:
+                    used_count_before = max(0, spin_index - 1)
+
                 cur.execute("""
                     INSERT OR REPLACE INTO roulette_spins (
                         id,
@@ -1022,14 +1080,14 @@ class RouletteDB:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     int(row.get("id") or 0),
-                    str(row.get("spin_date") or ""),
-                    str(row.get("week_key") or ""),
+                    spin_date,
+                    week_key,
                     str(row.get("phone") or ""),
                     str(row.get("rider_name") or ""),
                     int(row.get("today_completed") or 0),
-                    int(row.get("eligible_count") or 0),
-                    int(row.get("used_count_before") or 0),
-                    int(row.get("spin_index") or 1),
+                    eligible_count,
+                    used_count_before,
+                    spin_index,
                     int(row.get("segment_value") or 10),
                     int(row.get("reward_amount") or 0),
                     int(row.get("created_at") or 0),
@@ -1037,15 +1095,16 @@ class RouletteDB:
                 ))
                 restored_spins += 1
 
-            cur.execute("DELETE FROM backup_logs")
-            for row in backup_rows:
-                cur.execute("""
-                    INSERT INTO backup_logs (backup_file, created_at)
-                    VALUES (?, ?)
-                """, (
-                    str(row.get("backup_file") or ""),
-                    int(row.get("created_at") or 0),
-                ))
+            if backup_rows:
+                cur.execute("DELETE FROM backup_logs")
+                for row in backup_rows:
+                    cur.execute("""
+                        INSERT INTO backup_logs (backup_file, created_at)
+                        VALUES (?, ?)
+                    """, (
+                        str(row.get("backup_file") or ""),
+                        int(row.get("created_at") or 0),
+                    ))
 
             conn.commit()
             conn.close()
