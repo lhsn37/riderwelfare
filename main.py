@@ -61,6 +61,7 @@ LOGIN4_FILE = "login4_overrides.json"            # key: "normname|real4"  -> "lo
 PREVPLUS_FILE = "prevplus_overrides.json"        # key: "normname|login4" -> int
 PLANNEDPLUS_FILE = "plannedplus_overrides.json"  # key: "normname|login4" -> int
 ATTENDANCE_FILE = "attendance_log.json"          # key: login_key -> {period_start, period_end, days:[YYYY-MM-DD...]}
+STICKER_FILE = "sticker_overrides.json"          # key: login_key -> bool
 
 ATTENDANCE_BONUS_PER_DAY = 5
 ATTENDANCE_MIN_TODAY_COMPLETE = 6
@@ -73,6 +74,7 @@ _login4_lock = threading.Lock()
 _prevplus_lock = threading.Lock()
 _plannedplus_lock = threading.Lock()
 _att_lock = threading.Lock()
+_sticker_lock = threading.Lock()
 
 _rate_bucket: Dict[str, List[float]] = {}
 
@@ -513,12 +515,19 @@ def _att_get_record(att_map: Dict[str, Any], login_key: str) -> Dict[str, Any]:
 
 
 def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl: date) -> Tuple[int, int, bool]:
+    """
+    기간이 바뀌면:
+    - 지난 기간의 현재플러스(planned_plus + sticker_bonus)를 이전등급플러스(prev_plus)로 이동
+    - 현재플러스(planned_plus) 초기화
+    - 출석기록(days) 초기화
+    """
     att_map = load_attendance_map()
     rec = _att_get_record(att_map, login_key)
 
     rec_ps = safe_date_parse(rec.get("period_start", ""))
     rec_pe = safe_date_parse(rec.get("period_end", ""))
 
+    # 최초 생성
     if rec_ps is None or rec_pe is None or not rec.get("period_start"):
         rec["period_start"] = cur_start.isoformat()
         rec["period_end"] = cur_end_incl.isoformat()
@@ -527,26 +536,26 @@ def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl:
         save_attendance_map(att_map)
         return 0, get_prevplus(login_key), False
 
+    # 같은 기간이면 롤오버 없음
     if rec_ps == cur_start and rec_pe == cur_end_incl:
         return 0, get_prevplus(login_key), False
 
-    days = rec.get("days") or []
-    if not isinstance(days, list):
-        days = []
-    days = [d for d in days if isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)]
+    # 기간 변경 -> 현재기간 플러스 전체를 이전등급 플러스로 이관
+    old_planned_plus = get_plannedplus(login_key)
+    old_sticker_bonus = get_sticker_bonus(login_key)
+    moved_bonus = int(old_planned_plus or 0) + int(old_sticker_bonus or 0)
 
-    bonus = len(set(days)) * ATTENDANCE_BONUS_PER_DAY
-    if bonus:
-        prevplus_now = get_prevplus(login_key)
-        set_prevplus(login_key, prevplus_now + bonus)
+    set_prevplus(login_key, moved_bonus)
+    set_plannedplus(login_key, 0)
 
+    # 새 기간으로 출석기록 초기화
     rec["period_start"] = cur_start.isoformat()
     rec["period_end"] = cur_end_incl.isoformat()
     rec["days"] = []
     att_map[login_key] = rec
     save_attendance_map(att_map)
 
-    return bonus, get_prevplus(login_key), True
+    return moved_bonus, get_prevplus(login_key), True
 
 
 def attendance_is_checked_today(login_key: str, today: date, cur_start: date, cur_end_incl: date) -> bool:
@@ -593,6 +602,42 @@ def attendance_count_in_period(login_key: str, cur_start: date, cur_end_incl: da
     if not isinstance(days, list):
         return 0
     return len(set([d for d in days if isinstance(d, str)]))
+
+# -----------------------------
+# Sticker
+# -----------------------------
+def load_sticker_map() -> Dict[str, bool]:
+    with _sticker_lock:
+        if not os.path.exists(STICKER_FILE):
+            return {}
+        try:
+            with open(STICKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): bool(v) for k, v in data.items()}
+            return {}
+        except Exception:
+            return {}
+
+
+def save_sticker_map(data: Dict[str, bool]) -> None:
+    with _sticker_lock:
+        with open(STICKER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def is_sticker_attached(login_key: str) -> bool:
+    return bool(load_sticker_map().get(login_key, False))
+
+
+def get_sticker_bonus(login_key: str) -> int:
+    return 20 if is_sticker_attached(login_key) else 0
+
+
+def set_sticker_attached(login_key: str, checked: bool) -> None:
+    m = load_sticker_map()
+    m[login_key] = bool(checked)
+    save_sticker_map(m)
 
 
 # -----------------------------
@@ -1218,12 +1263,12 @@ def check(
     prev_completed_raw = int(cmap_prev.get(api_key, 0))
 
     login_key = f"{name_in}|{rider_login4}"
-    prev_plus = get_prevplus(login_key)
-    planned_plus = get_plannedplus(login_key)
-
     rolled_bonus, prevplus_after, rolled = attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
-    if rolled:
-        prev_plus = prevplus_after
+
+    prev_plus = get_prevplus(login_key)
+    planned_plus_base = get_plannedplus(login_key)
+    sticker_bonus = get_sticker_bonus(login_key)
+    planned_plus = planned_plus_base + sticker_bonus
 
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
@@ -1268,7 +1313,7 @@ def check(
 
     rollover_note = ""
     if rolled_bonus:
-        rollover_note = f"<div style='margin-top:8px;color:#111;font-size:13px;'><b>출석 이관:</b> 이전기간 출석보너스 {rolled_bonus}건이 현재등급(이전) 플러스에 자동 합산되었습니다.</div>"
+        rollover_note = f"<div style='margin-top:8px;color:#111;font-size:13px;'><b>기간 이관:</b> 이전기간 현재플러스 {rolled_bonus}건이 현재등급(이전) 플러스로 자동 이관되고 현재플러스는 초기화되었습니다.</div>"
 
     # 룰렛 상태
     roulette_status = roulette_db.get_status(
@@ -1385,11 +1430,15 @@ def check(
           <div style="color:#666; font-size:13px; line-height:1.6;">
             - 조건: <b>오늘 완료 {ATTENDANCE_MIN_TODAY_COMPLETE}건 이상</b>이면 출석체크 가능 (운행중/운행종료 무관)<br/>
             - 출석 1회당 <b>+{ATTENDANCE_BONUS_PER_DAY}건</b> (예정등급에 즉시 반영)<br/>
-            - 기간 종료 시 출석보너스는 <b>현재등급(이전) 플러스</b>로 자동 이관 후 초기화
+            - 기간 종료 시 <b>현재기간 플러스 전체</b>가 현재등급(이전) 플러스로 자동 이관되고 현재플러스는 초기화됩니다
           </div>
 
           <div style="margin-top:10px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-            <div style="color:#111; font-weight:900;">이번기간 출석: {att_count}회 (보너스 {att_count * ATTENDANCE_BONUS_PER_DAY}건)</div>
+            <div style="color:#111; font-weight:900;">
+                이번기간 출석: {att_count}회 (출석보너스 {att_count * ATTENDANCE_BONUS_PER_DAY}건)
+                / 스티커보너스 {sticker_bonus}건
+                / 현재플러스 합계 {planned_plus}건
+            </div>
             <form method="post" action="/attendance-check" style="margin:0;">
               <input type="hidden" name="name" value="{name}" />
               <input type="hidden" name="login4" value="{login4}" />
@@ -2045,6 +2094,26 @@ def admin_set_plannedplus(request: Request, key: str = Form(...), plannedplus: s
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
 
+@app.post("/admin/set-sticker")
+def admin_set_sticker(
+    request: Request,
+    key: str = Form(...),
+    sticker_attached: str = Form(default="0"),
+    redirect_q: str = Form(default="")
+):
+    r = require_admin(request)
+    if r:
+        return r
+
+    key = (key or "").strip()
+    if not key:
+        return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
+
+    checked = (sticker_attached == "1")
+    set_sticker_attached(key, checked)
+    return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
+
+
 @app.post("/admin/clear-plannedplus")
 def admin_clear_plannedplus(request: Request, key: str = Form(...), redirect_q: str = Form(default="")):
     r = require_admin(request)
@@ -2210,6 +2279,7 @@ def dashboard(request: Request, q: str = ""):
         eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
 
         cur_start, cur_end_incl = current_period(eff_join, today)
+        attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -2258,8 +2328,10 @@ def dashboard(request: Request, q: str = ""):
             cur_completed_raw = int(cmap.get(it["real_key"], 0))
             prev_completed_raw = int(prev_completed_map.get(it["real_key"], 0))
 
-            prev_plus = int(prevplus_map.get(it["login_key"], 0) or 0)
-            planned_plus = int(plannedplus_map.get(it["login_key"], 0) or 0)
+            prev_plus = get_prevplus(it["login_key"])
+            planned_plus_base = get_plannedplus(it["login_key"])
+            sticker_bonus = get_sticker_bonus(it["login_key"])
+            planned_plus = planned_plus_base + sticker_bonus
 
             planned_total = cur_completed_raw + planned_plus
             prev_total = prev_completed_raw + prev_plus
@@ -2327,6 +2399,9 @@ def dashboard(request: Request, q: str = ""):
 
                 "roulette_remain": int(roulette_status.get("remain_count") or 0),
                 "roulette_weekly_total": int(roulette_status.get("weekly_total") or 0),
+                "planned_plus_base": planned_plus_base,
+                "sticker_bonus": sticker_bonus,
+                "sticker_attached": is_sticker_attached(it["login_key"]),
             })
 
     final_rows.sort(key=lambda x: (x["cur_completed_raw"], -x["today_ratio"]), reverse=True)
@@ -2466,7 +2541,10 @@ def dashboard(request: Request, q: str = ""):
 
           <td style="padding:10px; border-bottom:1px solid #eee; color:#666; min-width:260px;">
             <div style="font-weight:700;">예정등급(현재) 플러스</div>
-            <div style="font-size:12px; color:#999;">예정등급 계산에만 적용</div>
+            <div style="font-size:12px; color:#999;">수동플러스 + 스티커(+20)가 예정등급 계산에 적용</div>
+            <div style="font-size:12px; color:#666; margin-top:4px;">
+                수동 {it['planned_plus_base']} + 스티커 {it['sticker_bonus']} = 합계 {it['planned_plus']}
+            </div>
             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
               <form method="post" action="/admin/set-plannedplus" style="display:flex; gap:6px; align-items:center;">
                 <input type="hidden" name="key" value="{it['login_key']}" />
@@ -2819,6 +2897,24 @@ def admin_roulette_page(request: Request):
         </div>
       </div>
 
+      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
+          <div style="font-weight:900; margin-bottom:10px;">룰렛 복원 업로드</div>
+          <div style="color:#666; font-size:13px; line-height:1.6; margin-bottom:10px;">
+            export JSON 또는 백업 JSON 파일을 업로드해서 룰렛 설정/당첨내역을 복원합니다.
+          </div>
+
+        <form id="rouletteImportForm" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input type="file" id="rouletteImportFile" name="file" accept=".json"
+                 style="font-size:14px;" />
+          <button type="button" onclick="importRouletteJson()"
+                  style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
+            업로드 복원
+        </button>
+      </form>
+
+  <div id="rouletteImportMsg" style="margin-top:10px; color:#666; font-size:13px;"></div>
+</div>
+
       <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
         <div style="border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
           <div style="font-weight:900; margin-bottom:10px;">기본 설정</div>
@@ -2840,6 +2936,11 @@ def admin_roulette_page(request: Request):
               <input type="number" id="maxSegmentValue" min="10" max="100" step="10" value="100"
                      style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
             </label>
+
+            <button onclick="downloadRouletteHistoryCsv()"
+                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
+                CSV 다운로드
+            </button>
 
             <button onclick="saveRouletteSettings()"
                     style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
@@ -3162,6 +3263,53 @@ def admin_roulette_page(request: Request):
         window.location.href = '/admin/api/roulette/payout.csv?week_key=' + encodeURIComponent(weekKey);
       }}
 
+      function downloadRouletteHistoryCsv() {{
+        const start_date = document.getElementById('startDate').value;
+        const end_date = document.getElementById('endDate').value;
+        const keyword = document.getElementById('keyword').value.trim();
+
+        const qs = new URLSearchParams();
+        if (start_date) qs.set('start_date', start_date);
+        if (end_date) qs.set('end_date', end_date);
+        if (keyword) qs.set('keyword', keyword);
+        qs.set('limit', '5000');
+
+        window.location.href = '/admin/api/roulette/history.csv?' + qs.toString();
+      }}
+
+      async function importRouletteJson() {{
+        const fileInput = document.getElementById('rouletteImportFile');
+        const msg = document.getElementById('rouletteImportMsg');
+
+        if (!fileInput.files || !fileInput.files.length) {{
+          msg.innerText = '업로드할 json 파일을 선택하세요.';
+          return;
+        }}
+
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        msg.innerText = '업로드 중...';
+
+        try {{
+          const res = await fetch('/admin/api/roulette/import', {{
+            method: 'POST',
+            body: formData
+          }});
+
+          const data = await res.json();
+          if (!res.ok || !data.ok) {{
+            throw new Error(data.detail || '복원 실패');
+          }}
+
+          msg.innerText = `복원 완료 / 스핀 ${{Number(data.restored_spins || 0)}}건 / 확률행 ${{Number(data.segment_reward_rows || 0)}}건`;
+          loadRouletteSettings();
+          loadRouletteHistory();
+        }} catch (e) {{
+          msg.innerText = e.message || '복원 실패';
+        }}
+      }}
+
       loadRouletteSettings();
       loadRouletteHistory();
     </script>
@@ -3237,16 +3385,32 @@ def admin_roulette_backup(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/api/roulette/export")
-def admin_roulette_export(request: Request):
+@app.post("/admin/api/roulette/import")
+async def admin_roulette_import(request: Request, file: UploadFile = File(...)):
     r = require_admin(request)
     if r:
         raise HTTPException(status_code=401, detail="admin required")
 
     try:
-        return roulette_db.export_json()
+        if not file.filename.lower().endswith(".json"):
+            raise HTTPException(status_code=400, detail="json 파일만 업로드 가능합니다.")
+
+        backup_info = roulette_db.create_backup()
+
+        raw = await file.read()
+        payload = json.loads(raw.decode("utf-8"))
+
+        result = roulette_db.import_json(payload)
+        return {
+            "ok": True,
+            "filename": file.filename,
+            "backup_name": backup_info.get("backup_name", ""),
+            **result,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/admin/api/roulette/payout.csv")
@@ -3285,6 +3449,81 @@ def admin_roulette_payout_csv(request: Request, week_key: str = ""):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/api/roulette/history.csv")
+def admin_roulette_history_csv(
+    request: Request,
+    start_date: str = "",
+    end_date: str = "",
+    keyword: str = "",
+    limit: int = 5000,
+):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        rows = roulette_db.get_history(
+            start_date=start_date or None,
+            end_date=end_date or None,
+            keyword=keyword or "",
+            limit=limit,
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "id",
+            "spin_date",
+            "time",
+            "rider_name",
+            "phone",
+            "today_completed",
+            "spin_index",
+            "segment_value",
+            "reward_amount",
+            "note",
+            "created_at",
+        ])
+
+        for row in rows:
+            created_at = int(row.get("created_at") or 0)
+            time_text = "-"
+            if created_at:
+                try:
+                    time_text = time.strftime("%H:%M:%S", time.localtime(created_at))
+                except Exception:
+                    time_text = "-"
+
+            writer.writerow([
+                row.get("id", ""),
+                row.get("spin_date", ""),
+                time_text,
+                row.get("rider_name", ""),
+                row.get("phone", ""),
+                row.get("today_completed", 0),
+                row.get("spin_index", 0),
+                row.get("segment_value", 0),
+                row.get("reward_amount", 0),
+                row.get("note", ""),
+                row.get("created_at", 0),
+            ])
+
+        s = start_date or "all"
+        e = end_date or "all"
+        filename = f"roulette_history_{s}_{e}.csv"
+
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv; charset=utf-8-sig",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------
+# Diagnostics
+# -----------------------------
 # -----------------------------
 # Diagnostics
 # -----------------------------

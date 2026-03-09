@@ -953,6 +953,109 @@ class RouletteDB:
             "spins": self.get_cycle_spins(week_key),
         }
 
+    def import_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        settings_rows = payload.get("settings") or []
+        reward_rows = payload.get("rewards") or []
+        segment_rows = payload.get("segment_rewards") or []
+        spin_rows = payload.get("spins") or []
+        backup_rows = payload.get("backups") or []
+
+        with DB_LOCK:
+            conn = self._connect()
+            cur = conn.cursor()
+
+            if settings_rows:
+                cur.execute("DELETE FROM settings")
+                for row in settings_rows:
+                    cur.execute("""
+                        INSERT INTO settings (key, value)
+                        VALUES (?, ?)
+                    """, (
+                        str(row.get("key") or ""),
+                        str(row.get("value") or ""),
+                    ))
+
+            cur.execute("DELETE FROM roulette_rewards")
+            for row in reward_rows:
+                cur.execute("""
+                    INSERT INTO roulette_rewards (amount, weight, active, sort_order)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    int(row.get("amount") or 0),
+                    int(row.get("weight") or 0),
+                    1 if row.get("active") else 0,
+                    int(row.get("sort_order") or 0),
+                ))
+
+            cur.execute("DELETE FROM roulette_segment_rewards")
+            for row in segment_rows:
+                cur.execute("""
+                    INSERT INTO roulette_segment_rewards
+                    (segment_value, amount, weight, active, sort_order)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    int(row.get("segment_value") or 0),
+                    int(row.get("amount") or 0),
+                    int(row.get("weight") or 0),
+                    1 if row.get("active") else 0,
+                    int(row.get("sort_order") or 0),
+                ))
+
+            restored_spins = 0
+            for row in spin_rows:
+                cur.execute("""
+                    INSERT OR REPLACE INTO roulette_spins (
+                        id,
+                        spin_date,
+                        week_key,
+                        phone,
+                        rider_name,
+                        today_completed,
+                        eligible_count,
+                        used_count_before,
+                        spin_index,
+                        segment_value,
+                        reward_amount,
+                        created_at,
+                        note
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    int(row.get("id") or 0),
+                    str(row.get("spin_date") or ""),
+                    str(row.get("week_key") or ""),
+                    str(row.get("phone") or ""),
+                    str(row.get("rider_name") or ""),
+                    int(row.get("today_completed") or 0),
+                    int(row.get("eligible_count") or 0),
+                    int(row.get("used_count_before") or 0),
+                    int(row.get("spin_index") or 1),
+                    int(row.get("segment_value") or 10),
+                    int(row.get("reward_amount") or 0),
+                    int(row.get("created_at") or 0),
+                    str(row.get("note") or ""),
+                ))
+                restored_spins += 1
+
+            cur.execute("DELETE FROM backup_logs")
+            for row in backup_rows:
+                cur.execute("""
+                    INSERT INTO backup_logs (backup_file, created_at)
+                    VALUES (?, ?)
+                """, (
+                    str(row.get("backup_file") or ""),
+                    int(row.get("created_at") or 0),
+                ))
+
+            conn.commit()
+            conn.close()
+
+        return {
+            "ok": True,
+            "restored_spins": restored_spins,
+            "segment_reward_rows": len(segment_rows),
+        }
+
 
 if __name__ == "__main__":
     db = RouletteDB("./data")
