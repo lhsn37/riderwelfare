@@ -6,27 +6,41 @@
 # - 관리자 대시보드: 이름 옆 거절+취소율 배지 표시
 # - 이전등급 플러스 / 예정등급 플러스 엑셀 백업 다운로드
 # - 기존 dashboard.xlsx 또는 plus-backup.xlsx 업로드 시 prev_plus / planned_plus 자동 복원
+# - 룰렛 기능:
+#   * 10건당 1회(기본) 룰렛 가능
+#   * 10~100건 구간별 서로 다른 확률표 적용
+#   * 운영주차 기준: 수요일 06:00 ~ 다음주 수요일 03:00
+#   * 개인 조회 화면에서 룰렛 상태/주간누적/최근당첨내역 표시
+#   * 관리자 지급 CSV 다운로드 / 룰렛 API 제공
 # ------------------------------------------------------------------------------------
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
 import threading
 import time
 from datetime import date, timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil.relativedelta import relativedelta
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile, Body, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import StreamingResponse
+
+from roulette_db import (
+    RouletteDB,
+    normalize_phone,
+    get_operational_cycle_bounds,
+    get_previous_operational_cycle_bounds,
+)
 
 # -----------------------------
 # Config
@@ -68,6 +82,9 @@ STORE_DIR.mkdir(parents=True, exist_ok=True)
 RIDERS_STORE = STORE_DIR / "store_riders.json"
 STATUS_STORE = STORE_DIR / "store_status.json"
 DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"
+
+# 룰렛 DB
+roulette_db = RouletteDB(str(STORE_DIR))
 
 # 메모리 캐시
 _riders_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
@@ -686,6 +703,65 @@ def not_ready_page() -> HTMLResponse:
 
 
 # -----------------------------
+# Roulette helpers
+# -----------------------------
+def find_rider_by_name_login4(name: str, login4: str) -> Optional[Dict[str, Any]]:
+    name_in = norm_name(name)
+    login4 = (login4 or "").strip()
+
+    riders = fetch_riders_cached()
+    candidates = [r for r in riders if norm_name(r.get("name", "")) == name_in]
+    matches: List[Dict[str, Any]] = []
+    for r in candidates:
+        l4, _, _ = get_login4_for_rider(r)
+        if l4 == login4:
+            matches.append(r)
+
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def get_today_completed_for_phone(phone: str) -> tuple[int, str]:
+    phone = normalize_phone(phone)
+    riders = fetch_riders_cached()
+    ds = fetch_delivery_status_cached()
+    stats_map = build_today_stats_map(ds)
+
+    for rider in riders:
+        rider_phone = normalize_phone(rider.get("phoneNumber", ""))
+        if rider_phone != phone:
+            continue
+
+        rider_name = rider.get("name", "") or ""
+        real4 = last4_from_phone(rider.get("phoneNumber", "") or "")
+        real_key = f"{norm_name(rider_name)}|{real4}"
+
+        today_info = stats_map.get(real_key) or {}
+        today_completed = int(today_info.get("complete") or 0)
+        return today_completed, rider_name
+
+    return 0, ""
+
+
+def get_rider_roulette_status_by_name_login4(name: str, login4: str) -> Dict[str, Any]:
+    rider = find_rider_by_name_login4(name, login4)
+    if not rider:
+        raise ValueError("조회 대상 라이더를 찾을 수 없습니다.")
+
+    rider_name = rider.get("name", "") or ""
+    rider_phone = normalize_phone(rider.get("phoneNumber", "") or "")
+
+    ds = fetch_delivery_status_cached()
+    stats_map = build_today_stats_map(ds)
+    real4 = last4_from_phone(rider.get("phoneNumber", "") or "")
+    api_key = f"{norm_name(rider_name)}|{real4}"
+    today_completed = int((stats_map.get(api_key) or {}).get("complete") or 0)
+
+    return roulette_db.get_status(rider_phone, rider_name, today_completed)
+
+
+# -----------------------------
 # Admin helpers
 # -----------------------------
 def require_admin(request: Request) -> Optional[RedirectResponse]:
@@ -901,7 +977,8 @@ def home():
 
       <div style="color:#888; margin-top:12px; font-size:13px;">
         * 완료건수는 ‘어제까지’ 반영됩니다. (등급용)<br/>
-        * 출석체크는 ‘오늘 완료건수’ 기준입니다. (실시간)
+        * 출석체크는 ‘오늘 완료건수’ 기준입니다. (실시간)<br/>
+        * 룰렛은 ‘오늘 완료건수’ 기준으로 10건당 1회 가능합니다.
       </div>
     </div>
     """
@@ -915,6 +992,9 @@ def check_get_redirect():
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_help():
+    cycle = get_operational_cycle_bounds()
+    prev_cycle = get_previous_operational_cycle_bounds()
+
     body = f"""
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:900px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">관리자</h2>
@@ -940,6 +1020,13 @@ def admin_help():
         <div>- 관리자 대시보드에서 <b>플러스 백업 엑셀</b> 다운로드 가능</div>
         <div>- 코드 업데이트 후 기존 <b>dashboard.xlsx</b> 또는 <b>plus-backup.xlsx</b> 업로드 시</div>
         <div>&nbsp;&nbsp;→ <b>이전등급 플러스(prev_plus)</b>, <b>예정등급 플러스(planned_plus)</b> 자동 복원</div>
+      </div>
+
+      <div style="margin-top:14px; background:#f5f7ff; border:1px solid #d9e1ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
+        <div><b>룰렛 운영주차</b></div>
+        <div>- 현재 운영주차: <b>{cycle["display_start"]}</b> ~ <b>{cycle["display_end"]}</b></div>
+        <div>- 직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b></div>
+        <div>- 지급 CSV: <b>/admin/api/roulette/payout.csv</b> (기본은 직전 마감 주차)</div>
       </div>
 
       <div style="margin-top:14px;">
@@ -1006,8 +1093,54 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/roulette-spin")
+def roulette_spin_page(request: Request, name: str = Form(...), login4: str = Form(...)):
+    if not store_ready():
+        return not_ready_page()
+
+    ip = request.client.host if request.client else "unknown"
+    if not rate_limit(ip):
+        return RedirectResponse("/", status_code=303)
+
+    rider = find_rider_by_name_login4(name, login4)
+    if not rider:
+        return RedirectResponse("/", status_code=303)
+
+    rider_name = rider.get("name", "") or ""
+    rider_phone = normalize_phone(rider.get("phoneNumber", "") or "")
+    real4 = last4_from_phone(rider.get("phoneNumber", "") or "")
+    ds = fetch_delivery_status_cached()
+    stats_map = build_today_stats_map(ds)
+    api_key = f"{norm_name(rider_name)}|{real4}"
+    today_completed = int((stats_map.get(api_key) or {}).get("complete") or 0)
+
+    try:
+        result = roulette_db.spin(rider_phone, rider_name, today_completed)
+        reward = int(result.get("reward") or 0)
+        return RedirectResponse(
+            f"/check-result?name={name}&login4={login4}&roulette_reward={reward}",
+            status_code=303
+        )
+    except Exception:
+        return RedirectResponse(
+            f"/check-result?name={name}&login4={login4}&roulette_error=1",
+            status_code=303
+        )
+
+
+@app.get("/check-result", response_class=HTMLResponse)
+def check_result_get(request: Request, name: str, login4: str, roulette_reward: int = 0, roulette_error: int = 0):
+    return check(request, name=name, login4=login4, roulette_reward=roulette_reward, roulette_error=roulette_error)
+
+
 @app.post("/check", response_class=HTMLResponse)
-def check(request: Request, name: str = Form(...), login4: str = Form(...)):
+def check(
+    request: Request,
+    name: str = Form(...),
+    login4: str = Form(...),
+    roulette_reward: int = 0,
+    roulette_error: int = 0,
+):
     if not store_ready():
         return not_ready_page()
 
@@ -1122,7 +1255,6 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     planned_grade = grade_from_total(planned_total)
     current_grade = grade_from_total(prev_total)
 
-    # 다음등급/남은건수도 예정등급 계산 기준과 동일하게
     nxt, remain = next_grade_target(planned_total)
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
@@ -1138,6 +1270,46 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
     if rolled_bonus:
         rollover_note = f"<div style='margin-top:8px;color:#111;font-size:13px;'><b>출석 이관:</b> 이전기간 출석보너스 {rolled_bonus}건이 현재등급(이전) 플러스에 자동 합산되었습니다.</div>"
 
+    # 룰렛 상태
+    roulette_status = roulette_db.get_status(
+        normalize_phone(rider.get("phoneNumber", "") or ""),
+        rider.get("name", "") or "",
+        today_completed,
+    )
+
+    roulette_alert_html = ""
+    if roulette_reward:
+        roulette_alert_html = f"""
+        <div style="margin-top:12px; padding:14px; border-radius:14px; background:#fff8db; border:1px solid #f1d27a;">
+          <div style="font-size:18px; font-weight:900; color:#111;">🎉 룰렛 당첨 {int(roulette_reward):,}원</div>
+        </div>
+        """
+    elif roulette_error:
+        roulette_alert_html = """
+        <div style="margin-top:12px; padding:14px; border-radius:14px; background:#fdecec; border:1px solid #f2b8b8;">
+          <div style="font-size:15px; font-weight:900; color:#b91c1c;">룰렛 처리 중 오류가 발생했거나 가능 횟수가 없습니다.</div>
+        </div>
+        """
+
+    recent_li = ""
+    for item in roulette_status.get("recent_spins", []) or []:
+        created_at = int(item.get("created_at") or 0)
+        ts_text = "-"
+        if created_at:
+            try:
+                ts_text = time.strftime("%m/%d %H:%M", time.localtime(created_at))
+            except Exception:
+                ts_text = "-"
+        recent_li += f"<li style='margin-bottom:4px;'>{ts_text} / {int(item.get('reward_amount') or 0):,}원 / {int(item.get('segment_value') or 0)}건 구간</li>"
+
+    if not recent_li:
+        recent_li = "<li>최근 당첨 내역 없음</li>"
+
+    cycle = roulette_status.get("cycle") or {}
+    can_spin = bool(roulette_status.get("can_spin"))
+    roulette_btn_bg = "#111" if can_spin else "#bbb"
+    roulette_btn_cursor = "pointer" if can_spin else "not-allowed"
+
     body = f"""
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:920px; margin:0 auto;">
       <h2 style="margin:0 0 6px 0;">등급 조회 결과</h2>
@@ -1150,6 +1322,8 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
         <div style="font-size:18px;"><b>{rider.get('name','')}</b> 님</div>
         <div style="color:#777; margin-top:6px;">휴대폰: {mask_phone(rider.get('phoneNumber',''))}</div>
       </div>
+
+      {roulette_alert_html}
 
       <div style="display:flex; gap:12px; margin-top:12px; flex-wrap:wrap;">
         <div style="flex:1; min-width:250px; padding:12px; border-radius:12px; border:1px solid #eee; background:#fff;">
@@ -1230,6 +1404,36 @@ def check(request: Request, name: str = Form(...), login4: str = Form(...)):
             </div>
           </div>
           {rollover_note}
+        </div>
+      </div>
+
+      <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
+        <div style="font-weight:900; margin-bottom:6px;">룰렛</div>
+        <div style="color:#666; font-size:13px; line-height:1.7;">
+          - 운영주차: <b>{cycle.get("display_start", "-")}</b> ~ <b>{cycle.get("display_end", "-")}</b><br/>
+          - 오늘 완료 {roulette_status.get("spin_unit", 10)}건당 1회 가능<br/>
+          - 현재 가능 횟수: <b>{roulette_status.get("remain_count", 0)}회</b> / 사용: <b>{roulette_status.get("used_count", 0)}회</b> / 총 가능: <b>{roulette_status.get("eligible_count", 0)}회</b><br/>
+          - 이번 운영주차 누적 당첨금: <b>{int(roulette_status.get("weekly_total") or 0):,}원</b><br/>
+          - 다음 룰렛 구간: <b>{int(roulette_status.get("next_segment_value") or 0)}건</b>
+        </div>
+
+        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+          <form method="post" action="/roulette-spin" style="margin:0;">
+            <input type="hidden" name="name" value="{name}" />
+            <input type="hidden" name="login4" value="{login4}" />
+            <button type="submit"
+              {'disabled' if not can_spin else ''}
+              style="padding:12px 16px; border:none; border-radius:12px; background:{roulette_btn_bg}; color:#fff; font-weight:900; cursor:{roulette_btn_cursor};">
+              {'룰렛 돌리기' if can_spin else '룰렛 불가'}
+            </button>
+          </form>
+
+          <div style="min-width:280px;">
+            <div style="font-weight:900; margin-bottom:6px;">최근 당첨 내역</div>
+            <ul style="margin:0; padding-left:18px; color:#666; font-size:13px; line-height:1.6;">
+              {recent_li}
+            </ul>
+          </div>
         </div>
       </div>
 
@@ -1649,6 +1853,9 @@ def dashboard(request: Request, q: str = ""):
                 **calc_bad_ratio(0, 0, 0),
             }
 
+            rider_phone = normalize_phone(rr.get("phoneNumber", "") or "")
+            roulette_status = roulette_db.get_status(rider_phone, nm, int(today_info["complete"]))
+
             final_rows.append({
                 "name": nm,
                 "created": created_d,
@@ -1684,6 +1891,9 @@ def dashboard(request: Request, q: str = ""):
                 "today_ratio_bg": str(today_info["bg"]),
                 "today_ratio_label": str(today_info["label"]),
                 "today_status_desc": str(today_info["status_desc"]),
+
+                "roulette_remain": int(roulette_status.get("remain_count") or 0),
+                "roulette_weekly_total": int(roulette_status.get("weekly_total") or 0),
             })
 
     final_rows.sort(key=lambda x: (x["cur_completed_raw"], -x["today_ratio"]), reverse=True)
@@ -1843,6 +2053,8 @@ def dashboard(request: Request, q: str = ""):
         </tr>
         """
 
+    cycle = get_previous_operational_cycle_bounds()
+
     body = f"""
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
@@ -1862,9 +2074,15 @@ def dashboard(request: Request, q: str = ""):
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">전체 엑셀 다운로드</a>
           <a href="/plus-backup.xlsx" style="text-decoration:none; color:#111;">플러스 백업 엑셀</a>
+          <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 룰렛 지급CSV</a>
+          <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">룰렛 JSON</a>
           <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
           <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
         </div>
+      </div>
+
+      <div style="margin-top:10px; color:#555; font-size:13px;">
+        직전 지급 주차: <b>{cycle["display_start"]}</b> ~ <b>{cycle["display_end"]}</b>
       </div>
 
       <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
@@ -2076,6 +2294,187 @@ def dashboard_excel(request: Request):
 
 
 # -----------------------------
+# Roulette API
+# -----------------------------
+@app.post("/api/roulette/status")
+def api_roulette_status(payload: dict = Body(...)):
+    phone = normalize_phone(payload.get("phone", ""))
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone required")
+
+    today_completed, rider_name = get_today_completed_for_phone(phone)
+    return roulette_db.get_status(phone, rider_name, today_completed)
+
+
+@app.post("/api/roulette/spin")
+def api_roulette_spin(payload: dict = Body(...)):
+    phone = normalize_phone(payload.get("phone", ""))
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone required")
+
+    today_completed, rider_name = get_today_completed_for_phone(phone)
+
+    try:
+        return roulette_db.spin(phone, rider_name, today_completed)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/admin/api/roulette/settings")
+def admin_get_roulette_settings(request: Request):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    return {
+        "enabled": roulette_db.get_enabled(),
+        "spin_unit": roulette_db.get_spin_unit(),
+        "max_segment_value": roulette_db.get_max_segment_value(),
+        "segment_rewards": roulette_db.get_all_segment_rewards(),
+        "current_cycle": get_operational_cycle_bounds(),
+        "previous_cycle": get_previous_operational_cycle_bounds(),
+    }
+
+
+@app.post("/admin/api/roulette/settings")
+def admin_save_roulette_settings(request: Request, payload: dict = Body(...)):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        enabled = bool(payload.get("enabled", True))
+        spin_unit = int(payload.get("spin_unit", 10))
+        max_segment_value = int(payload.get("max_segment_value", 100))
+        segment_rewards = payload.get("segment_rewards", [])
+
+        roulette_db.set_enabled(enabled)
+        roulette_db.set_spin_unit(spin_unit)
+        roulette_db.set_max_segment_value(max_segment_value)
+        roulette_db.set_segment_rewards(segment_rewards)
+
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/admin/api/roulette/history")
+def admin_get_roulette_history(
+    request: Request,
+    start_date: str = "",
+    end_date: str = "",
+    keyword: str = "",
+    limit: int = 300,
+):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    rows = roulette_db.get_history(
+        start_date=start_date or None,
+        end_date=end_date or None,
+        keyword=keyword or "",
+        limit=limit,
+    )
+    summary = roulette_db.get_history_summary(
+        start_date=start_date or None,
+        end_date=end_date or None,
+        keyword=keyword or "",
+    )
+    return {"rows": rows, "summary": summary}
+
+
+@app.post("/admin/api/roulette/spin/update")
+def admin_update_spin(request: Request, payload: dict = Body(...)):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        spin_id = int(payload.get("spin_id"))
+        reward_amount = int(payload.get("reward_amount"))
+        note = str(payload.get("note", ""))
+        row = roulette_db.update_spin(spin_id, reward_amount, note)
+        return {"ok": True, "row": row}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/api/roulette/spin/delete")
+def admin_delete_spin(request: Request, payload: dict = Body(...)):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        spin_id = int(payload.get("spin_id"))
+        roulette_db.delete_spin(spin_id)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/api/roulette/backup")
+def admin_roulette_backup(request: Request):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        return roulette_db.create_backup()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/api/roulette/export")
+def admin_roulette_export(request: Request):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        return roulette_db.export_json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/api/roulette/payout.csv")
+def admin_roulette_payout_csv(request: Request, week_key: str = ""):
+    r = require_admin(request)
+    if r:
+        raise HTTPException(status_code=401, detail="admin required")
+
+    try:
+        if not week_key:
+            cycle = get_previous_operational_cycle_bounds()
+            week_key = cycle["cycle_key"]
+
+        rows = roulette_db.get_cycle_payout_rows(week_key)
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["주차키", "이름", "전화번호", "룰렛횟수", "지급금액"])
+
+        for row in rows:
+            writer.writerow([
+                week_key,
+                row.get("rider_name", ""),
+                row.get("phone", ""),
+                row.get("spin_count", 0),
+                row.get("total_amount", 0),
+            ])
+
+        filename = f"roulette_payout_{week_key}.csv"
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv; charset=utf-8-sig",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------
 # Diagnostics
 # -----------------------------
 @app.get("/health", response_class=HTMLResponse)
@@ -2090,6 +2489,7 @@ def health():
     pcx_to = date.today() - timedelta(days=1)
     pcx_ready = (pcx_from <= pcx_to) and has_status_range(pcx_from, pcx_to)
 
+    roulette_export = roulette_db.export_json()
     body = f"""
     <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:820px; margin:0 auto;">
       <h3 style="margin-top:0;">Health</h3>
@@ -2099,6 +2499,8 @@ def health():
       <div>delivery_status_ts: <b>{delivery_ts}</b></div>
       <div style="margin-top:8px;">status_keys(sample): <b>{status_keys}</b></div>
       <div style="margin-top:8px;">pcx_range_ready({PCX_START_DATE.isoformat()}~어제): <b>{pcx_ready}</b></div>
+      <div style="margin-top:8px;">roulette_enabled: <b>{roulette_db.get_enabled()}</b></div>
+      <div style="margin-top:8px;">roulette_segment_rows: <b>{len(roulette_export.get('segment_rewards', []))}</b></div>
       <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 홈</a></div>
     </div>
     """
