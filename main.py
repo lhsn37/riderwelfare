@@ -1407,35 +1407,468 @@ def check(
         </div>
       </div>
 
-      <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
-        <div style="font-weight:900; margin-bottom:6px;">룰렛</div>
-        <div style="color:#666; font-size:13px; line-height:1.7;">
-          - 운영주차: <b>{cycle.get("display_start", "-")}</b> ~ <b>{cycle.get("display_end", "-")}</b><br/>
-          - 오늘 완료 {roulette_status.get("spin_unit", 10)}건당 1회 가능<br/>
-          - 현재 가능 횟수: <b>{roulette_status.get("remain_count", 0)}회</b> / 사용: <b>{roulette_status.get("used_count", 0)}회</b> / 총 가능: <b>{roulette_status.get("eligible_count", 0)}회</b><br/>
-          - 이번 운영주차 누적 당첨금: <b>{int(roulette_status.get("weekly_total") or 0):,}원</b><br/>
-          - 다음 룰렛 구간: <b>{int(roulette_status.get("next_segment_value") or 0)}건</b>
-        </div>
+    <div style="margin-top:12px; padding:14px; border:1px solid #eee; border-radius:18px; background:linear-gradient(180deg,#ffffff 0%,#fcfcff 100%);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+    <div>
+      <div style="font-weight:900; font-size:18px; color:#111;">룰렛</div>
+      <div style="color:#666; font-size:13px; line-height:1.7; margin-top:6px;">
+        운영주차: <b>{cycle.get("display_start", "-")}</b> ~ <b>{cycle.get("display_end", "-")}</b><br/>
+        오늘 완료 {roulette_status.get("spin_unit", 10)}건당 1회<br/>
+        다음 룰렛 구간: <b><span id="nextSegmentText">{int(roulette_status.get("next_segment_value") or 0)}</span>건</b>
+      </div>
+    </div>
 
-        <div style="margin-top:12px; display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
-          <form method="post" action="/roulette-spin" style="margin:0;">
-            <input type="hidden" name="name" value="{name}" />
-            <input type="hidden" name="login4" value="{login4}" />
-            <button type="submit"
-              {'disabled' if not can_spin else ''}
-              style="padding:12px 16px; border:none; border-radius:12px; background:{roulette_btn_bg}; color:#fff; font-weight:900; cursor:{roulette_btn_cursor};">
-              {'룰렛 돌리기' if can_spin else '룰렛 불가'}
-            </button>
-          </form>
+    <div style="min-width:180px; padding:10px 12px; border-radius:14px; background:#f8fafc; border:1px solid #edf2f7;">
+      <div style="font-size:12px; color:#666;">이번 운영주차 누적당첨금</div>
+      <div id="weeklyTotalText" style="font-size:24px; font-weight:900; color:#111; margin-top:4px;">
+        {int(roulette_status.get("weekly_total") or 0):,}원
+      </div>
+    </div>
+  </div>
 
-          <div style="min-width:280px;">
-            <div style="font-weight:900; margin-bottom:6px;">최근 당첨 내역</div>
-            <ul style="margin:0; padding-left:18px; color:#666; font-size:13px; line-height:1.6;">
-              {recent_li}
-            </ul>
+  <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;">
+    <div style="flex:1; min-width:120px; padding:10px 12px; border-radius:14px; background:#fafafa; border:1px solid #eee;">
+      <div style="font-size:12px; color:#777;">가능 횟수</div>
+      <div id="remainCountText" style="font-size:22px; font-weight:900; color:#111;">{roulette_status.get("remain_count", 0)}회</div>
+    </div>
+
+    <div style="flex:1; min-width:120px; padding:10px 12px; border-radius:14px; background:#fafafa; border:1px solid #eee;">
+      <div style="font-size:12px; color:#777;">사용 횟수</div>
+      <div id="usedCountText" style="font-size:22px; font-weight:900; color:#111;">{roulette_status.get("used_count", 0)}회</div>
+    </div>
+
+    <div style="flex:1; min-width:120px; padding:10px 12px; border-radius:14px; background:#fafafa; border:1px solid #eee;">
+      <div style="font-size:12px; color:#777;">총 가능</div>
+      <div id="eligibleCountText" style="font-size:22px; font-weight:900; color:#111;">{roulette_status.get("eligible_count", 0)}회</div>
+    </div>
+  </div>
+
+  <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+    <button
+      type="button"
+      id="openRouletteBtn"
+      {'disabled' if not can_spin else ''}
+      onclick="openRouletteModal()"
+      style="
+        padding:14px 18px;
+        border:none;
+        border-radius:16px;
+        background:{roulette_btn_bg};
+        color:#fff;
+        font-weight:900;
+        font-size:17px;
+        cursor:{roulette_btn_cursor};
+        min-width:150px;
+        box-shadow:0 8px 18px rgba(17,17,17,0.18);
+      ">
+      {'룰렛 돌리기' if can_spin else '룰렛 불가'}
+    </button>
+
+    <div style="min-width:280px; flex:1;">
+      <div style="font-weight:900; margin-bottom:6px;">최근 당첨 내역</div>
+      <ul id="recentRouletteList" style="margin:0; padding-left:18px; color:#666; font-size:13px; line-height:1.7;">
+        {recent_li}
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div id="rouletteModal" style="
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(15,23,42,0.62);
+  z-index:9999;
+  padding:14px;
+  box-sizing:border-box;
+  backdrop-filter:blur(2px);
+">
+  <div style="
+    max-width:430px;
+    margin:0 auto;
+    min-height:100%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  ">
+    <div style="
+      width:100%;
+      border-radius:28px;
+      padding:18px 16px 20px 16px;
+      box-sizing:border-box;
+      position:relative;
+      overflow:hidden;
+      background:
+        radial-gradient(circle at top, rgba(255,255,255,0.98) 0%, rgba(250,250,255,0.98) 55%, rgba(245,247,255,0.98) 100%);
+      box-shadow:0 24px 60px rgba(0,0,0,0.28);
+      border:1px solid rgba(255,255,255,0.5);
+    ">
+      <div style="
+        position:absolute;
+        inset:auto -60px -60px auto;
+        width:180px;
+        height:180px;
+        border-radius:50%;
+        background:radial-gradient(circle, rgba(99,102,241,0.18), rgba(99,102,241,0));
+      "></div>
+
+      <button type="button" onclick="closeRouletteModal()" style="
+        position:absolute;
+        right:12px;
+        top:12px;
+        border:none;
+        background:#eef2f7;
+        width:38px;
+        height:38px;
+        border-radius:999px;
+        font-size:22px;
+        cursor:pointer;
+        color:#111;
+      ">×</button>
+
+      <div style="font-size:28px; font-weight:900; color:#111; letter-spacing:-0.02em;">행운 룰렛</div>
+      <div style="color:#667085; font-size:14px; margin-top:6px;">
+        서버 당첨 결과에 맞춰 실제 회전 후 멈춥니다
+      </div>
+
+      <div id="rouletteConfetti" style="position:relative; height:0; overflow:visible;"></div>
+
+      <div style="margin-top:18px; display:flex; justify-content:center;">
+        <div style="position:relative; width:310px; height:310px;">
+          <div style="
+            position:absolute;
+            left:50%;
+            top:-8px;
+            transform:translateX(-50%);
+            width:0;
+            height:0;
+            border-left:18px solid transparent;
+            border-right:18px solid transparent;
+            border-bottom:34px solid #ef4444;
+            z-index:4;
+            filter:drop-shadow(0 3px 3px rgba(0,0,0,0.16));
+          "></div>
+
+          <div style="
+            position:absolute;
+            inset:0;
+            border-radius:50%;
+            background:radial-gradient(circle, rgba(255,255,255,0.6), rgba(255,255,255,0));
+            z-index:0;
+            transform:scale(1.07);
+          "></div>
+
+          <div id="rouletteWheel" style="
+            width:310px;
+            height:310px;
+            border-radius:50%;
+            border:12px solid #f6e9e9;
+            box-sizing:border-box;
+            position:relative;
+            overflow:hidden;
+            transform:rotate(0deg);
+            transition:transform 5.8s cubic-bezier(0.12, 0.82, 0.16, 1);
+            background:
+              conic-gradient(
+                #e7ecf8 0deg 72deg,
+                #f0dede 72deg 144deg,
+                #e7ecf8 144deg 216deg,
+                #f0dede 216deg 288deg,
+                #e7ecf8 288deg 360deg
+              );
+            box-shadow:
+              inset 0 0 0 8px rgba(0,0,0,0.05),
+              0 16px 36px rgba(15,23,42,0.18);
+          ">
+            <div style="position:absolute; inset:0; border-radius:50%;">
+              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(36deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">1,000원</div>
+              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(108deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">2,000원</div>
+              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(180deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">3,000원</div>
+              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(252deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">5,000원</div>
+              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(324deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">10,000원</div>
+            </div>
+
+            <div style="
+              position:absolute;
+              left:50%;
+              top:50%;
+              transform:translate(-50%,-50%);
+              width:84px;
+              height:84px;
+              border-radius:50%;
+              background:linear-gradient(180deg,#ffffff 0%,#f8fafc 100%);
+              border:7px solid #e5e7eb;
+              display:flex;
+              align-items:center;
+              justify-content:center;
+              font-weight:900;
+              font-size:18px;
+              color:#111;
+              z-index:3;
+              box-shadow:0 8px 18px rgba(0,0,0,0.14);
+            ">
+              SPIN
+            </div>
           </div>
         </div>
       </div>
+
+      <div id="rouletteResultText" style="
+        margin-top:20px;
+        text-align:center;
+        font-size:20px;
+        font-weight:900;
+        color:#111;
+        min-height:32px;
+      ">
+        버튼을 누르면 회전합니다
+      </div>
+
+      <div style="margin-top:16px; display:flex; gap:10px;">
+        <button
+          type="button"
+          id="realSpinBtn"
+          {'disabled' if not can_spin else ''}
+          onclick="startRouletteSpin()"
+          style="
+            flex:1;
+            padding:15px 16px;
+            border:none;
+            border-radius:16px;
+            background:{roulette_btn_bg};
+            color:#fff;
+            font-size:18px;
+            font-weight:900;
+            cursor:{roulette_btn_cursor};
+            box-shadow:0 10px 20px rgba(17,17,17,0.18);
+          ">
+          {'돌리기' if can_spin else '불가'}
+        </button>
+
+        <button
+          type="button"
+          onclick="closeRouletteModal()"
+          style="
+            padding:15px 16px;
+            border:none;
+            border-radius:16px;
+            background:#eef2f7;
+            color:#111;
+            font-size:16px;
+            font-weight:900;
+          ">
+          닫기
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let rouletteSpinning = false;
+  let rouletteCurrentRotation = 0;
+
+  function openRouletteModal() {{
+    document.getElementById('rouletteModal').style.display = 'block';
+  }}
+
+  function closeRouletteModal() {{
+    if (rouletteSpinning) return;
+    document.getElementById('rouletteModal').style.display = 'none';
+  }}
+
+  function rewardToStopAngle(reward) {{
+    const map = {{
+      1000: 324,
+      2000: 252,
+      3000: 180,
+      5000: 108,
+      10000: 36
+    }};
+    return map[reward] ?? 324;
+  }}
+
+  function makeConfetti() {{
+    const wrap = document.getElementById('rouletteConfetti');
+    wrap.innerHTML = '';
+    const colors = ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'];
+
+    for (let i = 0; i < 24; i++) {{
+      const div = document.createElement('div');
+      const left = Math.random() * 100;
+      const delay = Math.random() * 0.4;
+      const duration = 1.2 + Math.random() * 0.7;
+      const rotate = Math.random() * 360;
+      const color = colors[i % colors.length];
+
+      div.style.cssText = `
+        position:absolute;
+        left:${{left}}%;
+        top:0;
+        width:10px;
+        height:16px;
+        background:${{color}};
+        opacity:0.95;
+        border-radius:2px;
+        transform:rotate(${{rotate}}deg);
+        animation: confettiDrop ${{duration}}s ease-in forwards;
+        animation-delay:${{delay}}s;
+      `;
+      wrap.appendChild(div);
+    }}
+
+    if (!document.getElementById('confettiStyle')) {{
+      const style = document.createElement('style');
+      style.id = 'confettiStyle';
+      style.innerHTML = `
+        @keyframes confettiDrop {{
+          0% {{ transform: translateY(0) rotate(0deg); opacity:1; }}
+          100% {{ transform: translateY(180px) rotate(360deg); opacity:0; }}
+        }}
+      `;
+      document.head.appendChild(style);
+    }}
+  }}
+
+  function prependRecentHistory(reward, segmentValue) {{
+    const ul = document.getElementById('recentRouletteList');
+    const li = document.createElement('li');
+
+    const now = new Date();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mi = String(now.getMinutes()).padStart(2, '0');
+
+    li.style.marginBottom = '4px';
+    li.textContent = `${{mm}}/${{dd}} ${{hh}}:${{mi}} / ${{Number(reward).toLocaleString()}}원 / ${{segmentValue}}건 구간`;
+
+    if (ul.firstChild && ul.firstChild.textContent === '최근 당첨 내역 없음') {{
+      ul.innerHTML = '';
+    }}
+
+    ul.prepend(li);
+
+    while (ul.children.length > 5) {{
+      ul.removeChild(ul.lastChild);
+    }}
+  }}
+
+  function updateRouletteSummary(data) {{
+    document.getElementById('weeklyTotalText').innerText =
+      Number(data.weekly_total || 0).toLocaleString() + '원';
+
+    document.getElementById('remainCountText').innerText =
+      String(data.remain_count || 0) + '회';
+
+    document.getElementById('usedCountText').innerText =
+      String(data.used_count || 0) + '회';
+
+    document.getElementById('eligibleCountText').innerText =
+      String(data.eligible_count || 0) + '회';
+
+    const nextSegment = Math.min(100, (Number(data.used_count || 0) + 1) * {roulette_status.get("spin_unit", 10)});
+    document.getElementById('nextSegmentText').innerText = String(data.remain_count > 0 ? nextSegment : 0);
+
+    const openBtn = document.getElementById('openRouletteBtn');
+    const spinBtn = document.getElementById('realSpinBtn');
+
+    if (Number(data.remain_count || 0) <= 0) {{
+      openBtn.disabled = true;
+      openBtn.innerText = '룰렛 불가';
+      openBtn.style.background = '#bbb';
+      openBtn.style.cursor = 'not-allowed';
+
+      if (spinBtn) {{
+        spinBtn.disabled = true;
+        spinBtn.innerText = '불가';
+        spinBtn.style.background = '#bbb';
+        spinBtn.style.cursor = 'not-allowed';
+      }}
+    }} else {{
+      openBtn.disabled = false;
+      openBtn.innerText = '룰렛 돌리기';
+      openBtn.style.background = '#111';
+      openBtn.style.cursor = 'pointer';
+
+      if (spinBtn && !rouletteSpinning) {{
+        spinBtn.disabled = false;
+        spinBtn.innerText = '다시 돌리기';
+        spinBtn.style.background = '#111';
+        spinBtn.style.cursor = 'pointer';
+      }}
+    }}
+  }}
+
+  async function refreshRouletteStatus() {{
+    const res = await fetch('/api/roulette/status', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        phone: "{normalize_phone(rider.get('phoneNumber', '') or '')}"
+      }})
+    }});
+    const data = await res.json();
+    if (res.ok) {{
+      updateRouletteSummary(data);
+    }}
+  }}
+
+  async function startRouletteSpin() {{
+    if (rouletteSpinning) return;
+
+    rouletteSpinning = true;
+    const btn = document.getElementById('realSpinBtn');
+    const wheel = document.getElementById('rouletteWheel');
+    const resultText = document.getElementById('rouletteResultText');
+
+    btn.disabled = true;
+    btn.innerText = '회전 중...';
+    resultText.innerText = '당첨 결과를 확인하고 있어요...';
+
+    try {{
+      const res = await fetch('/api/roulette/spin', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          phone: "{normalize_phone(rider.get('phoneNumber', '') or '')}"
+        }})
+      }});
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {{
+        throw new Error(data.detail || '룰렛 처리 실패');
+      }}
+
+      const reward = Number(data.reward || 0);
+      const stopAngle = rewardToStopAngle(reward);
+      const extraSpins = 360 * 7;
+
+      rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + stopAngle;
+      wheel.style.transform = `rotate(${{rouletteCurrentRotation}}deg)`;
+
+      setTimeout(() => {{
+        makeConfetti();
+        resultText.innerText = `🎉 ${{reward.toLocaleString()}}원 당첨`;
+      }}, 5200);
+
+      setTimeout(async () => {{
+        prependRecentHistory(reward, Number(data.segment_value || 0));
+        updateRouletteSummary(data);
+        btn.innerText = '완료';
+        rouletteSpinning = false;
+        await refreshRouletteStatus();
+      }}, 5900);
+
+    }} catch (e) {{
+      resultText.innerText = e.message || '룰렛 처리 중 오류';
+      btn.disabled = false;
+      btn.innerText = '다시 시도';
+      rouletteSpinning = false;
+    }}
+  }}
+</script>
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
         <div style="font-weight:900; margin-bottom:6px;">PCX 이벤트 누적 완료건수</div>
@@ -2072,12 +2505,13 @@ def dashboard(request: Request, q: str = ""):
         </div>
 
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-          <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">전체 엑셀 다운로드</a>
-          <a href="/plus-backup.xlsx" style="text-decoration:none; color:#111;">플러스 백업 엑셀</a>
-          <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 룰렛 지급CSV</a>
-          <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">룰렛 JSON</a>
-          <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
-          <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
+            <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">전체 엑셀 다운로드</a>
+            <a href="/plus-backup.xlsx" style="text-decoration:none; color:#111;">플러스 백업 엑셀</a>
+            <a href="/admin/roulette" style="text-decoration:none; color:#111; font-weight:900;">룰렛 관리자</a>
+            <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 룰렛 지급CSV</a>
+            <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">룰렛 JSON</a>
+            <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
+            <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
         </div>
       </div>
 
@@ -2356,6 +2790,383 @@ def admin_save_roulette_settings(request: Request, payload: dict = Body(...)):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/admin/roulette", response_class=HTMLResponse)
+def admin_roulette_page(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+
+    current_cycle = get_operational_cycle_bounds()
+    prev_cycle = get_previous_operational_cycle_bounds()
+
+    body = f"""
+    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+        <div>
+          <h2 style="margin:0 0 6px 0;">룰렛 관리자</h2>
+          <div style="color:#666; line-height:1.7;">
+            현재 운영주차: <b>{current_cycle["display_start"]}</b> ~ <b>{current_cycle["display_end"]}</b><br/>
+            직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <a href="/dashboard" style="text-decoration:none; color:#111;">전체 대시보드</a>
+          <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 지급 CSV</a>
+          <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">JSON 내보내기</a>
+          <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
+        </div>
+      </div>
+
+      <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+        <div style="border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
+          <div style="font-weight:900; margin-bottom:10px;">기본 설정</div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+            <label style="display:flex; gap:6px; align-items:center;">
+              <input type="checkbox" id="rouletteEnabled" />
+              <span>룰렛 사용</span>
+            </label>
+
+            <label style="display:flex; gap:6px; align-items:center;">
+              <span>기준</span>
+              <input type="number" id="spinUnit" min="1" value="10"
+                     style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+              <span>건당 1회</span>
+            </label>
+
+            <label style="display:flex; gap:6px; align-items:center;">
+              <span>최대 구간</span>
+              <input type="number" id="maxSegmentValue" min="10" max="100" step="10" value="100"
+                     style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+            </label>
+
+            <button onclick="saveRouletteSettings()"
+                    style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
+              설정 저장
+            </button>
+
+            <button onclick="backupRouletteDb()"
+                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
+              DB 백업
+            </button>
+          </div>
+          <div id="saveMsg" style="margin-top:10px; color:#666; font-size:13px;"></div>
+        </div>
+
+        <div style="border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
+          <div style="font-weight:900; margin-bottom:10px;">지급 다운로드</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input type="text" id="weekKeyInput" placeholder="예: 2026-03-04"
+                   style="width:180px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+            <button onclick="downloadPayoutCsv()"
+                    style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
+              주차 지정 CSV
+            </button>
+            <button onclick="downloadPrevPayoutCsv()"
+                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
+              직전주 CSV
+            </button>
+          </div>
+          <div style="margin-top:8px; color:#888; font-size:12px;">
+            비워두면 직전 마감 운영주차 기준으로 다운로드됩니다.
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fff;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+          <div style="font-weight:900;">구간별 확률 설정</div>
+          <div style="color:#777; font-size:13px;">10건 ~ 100건 구간별로 각각 수정 가능</div>
+        </div>
+        <div id="segmentRewardWrap" style="margin-top:12px; overflow:auto;"></div>
+      </div>
+
+      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fff;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+          <div style="font-weight:900;">당첨 내역</div>
+          <div id="historySummary" style="color:#666; font-size:13px;"></div>
+        </div>
+
+        <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <input type="date" id="startDate"
+                 style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+          <input type="date" id="endDate"
+                 style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+          <input type="text" id="keyword" placeholder="이름 또는 전화번호"
+                 style="width:220px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+          <button onclick="loadRouletteHistory()"
+                  style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
+            조회
+          </button>
+        </div>
+
+        <div style="margin-top:12px; overflow:auto; border:1px solid #eee; border-radius:12px;">
+          <table style="border-collapse:collapse; width:100%; min-width:1100px;">
+            <thead>
+              <tr style="background:#fafafa;">
+                <th style="padding:10px; border-bottom:1px solid #eee;">ID</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">날짜</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">시간</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">이름</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">전화번호</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">오늘완료</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">회차</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">구간</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">당첨금</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">비고</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">수정</th>
+                <th style="padding:10px; border-bottom:1px solid #eee;">삭제</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr><td colspan="12" style="padding:14px; color:#777;">불러오는 중...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function fmtMoney(v) {{
+        return Number(v || 0).toLocaleString() + '원';
+      }}
+
+      function fmtTs(ts) {{
+        if (!ts) return '-';
+        const d = new Date(Number(ts) * 1000);
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const ss = String(d.getSeconds()).padStart(2, '0');
+        return `${{hh}}:${{mm}}:${{ss}}`;
+      }}
+
+      function segmentList() {{
+        const arr = [];
+        for (let i = 10; i <= 100; i += 10) arr.push(i);
+        return arr;
+      }}
+
+      async function loadRouletteSettings() {{
+        const res = await fetch('/admin/api/roulette/settings');
+        const data = await res.json();
+
+        document.getElementById('rouletteEnabled').checked = !!data.enabled;
+        document.getElementById('spinUnit').value = data.spin_unit || 10;
+        document.getElementById('maxSegmentValue').value = data.max_segment_value || 100;
+
+        const grouped = {{}};
+        (data.segment_rewards || []).forEach(r => {{
+          const seg = Number(r.segment_value || 0);
+          if (!grouped[seg]) grouped[seg] = [];
+          grouped[seg].push(r);
+        }});
+
+        const wrap = document.getElementById('segmentRewardWrap');
+        let html = `<table style="border-collapse:collapse; width:100%; min-width:900px;">
+          <thead>
+            <tr style="background:#fafafa;">
+              <th style="padding:10px; border-bottom:1px solid #eee;">구간</th>
+              <th style="padding:10px; border-bottom:1px solid #eee;">1000원</th>
+              <th style="padding:10px; border-bottom:1px solid #eee;">2000원</th>
+              <th style="padding:10px; border-bottom:1px solid #eee;">3000원</th>
+              <th style="padding:10px; border-bottom:1px solid #eee;">5000원</th>
+              <th style="padding:10px; border-bottom:1px solid #eee;">10000원</th>
+            </tr>
+          </thead>
+          <tbody>`;
+
+        const amounts = [1000, 2000, 3000, 5000, 10000];
+
+        segmentList().forEach(seg => {{
+          const rows = grouped[seg] || [];
+          const byAmount = {{}};
+          rows.forEach(r => byAmount[Number(r.amount)] = r);
+
+          html += `<tr>
+            <td style="padding:10px; border-bottom:1px solid #eee; font-weight:900;">${{seg}}건</td>`;
+
+          amounts.forEach(amount => {{
+            const row = byAmount[amount] || {{ weight: 0, active: 1 }};
+            html += `
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+                <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
+                  <input type="number"
+                         data-seg="${{seg}}"
+                         data-amount="${{amount}}"
+                         class="weight-input"
+                         value="${{row.weight || 0}}"
+                         style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+                  <label style="font-size:12px; color:#666; display:flex; gap:4px; align-items:center;">
+                    <input type="checkbox"
+                           data-seg="${{seg}}"
+                           data-amount="${{amount}}"
+                           class="active-input"
+                           ${{row.active ? 'checked' : ''}} />
+                    사용
+                  </label>
+                </div>
+              </td>`;
+          }});
+
+          html += `</tr>`;
+        }});
+
+        html += `</tbody></table>`;
+        wrap.innerHTML = html;
+      }}
+
+      async function saveRouletteSettings() {{
+        const enabled = document.getElementById('rouletteEnabled').checked;
+        const spin_unit = Number(document.getElementById('spinUnit').value || 10);
+        const max_segment_value = Number(document.getElementById('maxSegmentValue').value || 100);
+
+        const payloadRows = [];
+        const amounts = [1000, 2000, 3000, 5000, 10000];
+
+        segmentList().forEach(seg => {{
+          amounts.forEach((amount, idx) => {{
+            const w = document.querySelector(`.weight-input[data-seg="${{seg}}"][data-amount="${{amount}}"]`);
+            const a = document.querySelector(`.active-input[data-seg="${{seg}}"][data-amount="${{amount}}"]`);
+            payloadRows.push({{
+              segment_value: seg,
+              amount: amount,
+              weight: Number(w?.value || 0),
+              active: !!a?.checked,
+              sort_order: idx + 1
+            }});
+          }});
+        }});
+
+        const res = await fetch('/admin/api/roulette/settings', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            enabled,
+            spin_unit,
+            max_segment_value,
+            segment_rewards: payloadRows
+          }})
+        }});
+
+        const data = await res.json();
+        document.getElementById('saveMsg').innerText = data.ok ? '저장 완료' : (data.detail || '저장 실패');
+        if (data.ok) loadRouletteSettings();
+      }}
+
+      async function loadRouletteHistory() {{
+        const start_date = document.getElementById('startDate').value;
+        const end_date = document.getElementById('endDate').value;
+        const keyword = document.getElementById('keyword').value.trim();
+
+        const qs = new URLSearchParams();
+        if (start_date) qs.set('start_date', start_date);
+        if (end_date) qs.set('end_date', end_date);
+        if (keyword) qs.set('keyword', keyword);
+        qs.set('limit', '300');
+
+        const res = await fetch('/admin/api/roulette/history?' + qs.toString());
+        const data = await res.json();
+
+        const tbody = document.getElementById('historyBody');
+        const summary = document.getElementById('historySummary');
+        summary.innerText = `조회건수 ${{Number(data.summary?.count || 0)}}건 / 총 당첨금 ${{fmtMoney(data.summary?.total_amount || 0)}}`;
+
+        const rows = data.rows || [];
+        if (!rows.length) {{
+          tbody.innerHTML = '<tr><td colspan="12" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>';
+          return;
+        }}
+
+        let html = '';
+        rows.forEach(row => {{
+          html += `
+            <tr>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.id}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_date || '-'}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{fmtTs(row.created_at)}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.rider_name || ''}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.phone || ''}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.today_completed || 0}}</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_index || 0}}회차</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.segment_value || 0}}건</td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+                <input type="number" id="amt_${{row.id}}" value="${{row.reward_amount || 0}}"
+                       style="width:100px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+              </td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+                <input type="text" id="note_${{row.id}}" value="${{row.note || ''}}"
+                       style="width:180px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+              </td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+                <button onclick="updateRouletteSpin(${{row.id}})"
+                        style="padding:8px 12px; border:none; border-radius:10px; background:#111; color:#fff;">
+                  수정
+                </button>
+              </td>
+              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
+                <button onclick="deleteRouletteSpin(${{row.id}})"
+                        style="padding:8px 12px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">
+                  삭제
+                </button>
+              </td>
+            </tr>`;
+        }});
+
+        tbody.innerHTML = html;
+      }}
+
+      async function updateRouletteSpin(id) {{
+        const reward_amount = Number(document.getElementById('amt_' + id).value || 0);
+        const note = document.getElementById('note_' + id).value || '';
+
+        const res = await fetch('/admin/api/roulette/spin/update', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ spin_id: id, reward_amount, note }})
+        }});
+        const data = await res.json();
+        alert(data.ok ? '수정 완료' : (data.detail || '수정 실패'));
+        if (data.ok) loadRouletteHistory();
+      }}
+
+      async function deleteRouletteSpin(id) {{
+        if (!confirm('정말 삭제하시겠습니까?')) return;
+
+        const res = await fetch('/admin/api/roulette/spin/delete', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ spin_id: id }})
+        }});
+        const data = await res.json();
+        alert(data.ok ? '삭제 완료' : (data.detail || '삭제 실패'));
+        if (data.ok) loadRouletteHistory();
+      }}
+
+      async function backupRouletteDb() {{
+        const res = await fetch('/admin/api/roulette/backup', {{ method: 'POST' }});
+        const data = await res.json();
+        alert(data.ok ? ('백업 완료: ' + data.backup_name) : (data.detail || '백업 실패'));
+      }}
+
+      function downloadPrevPayoutCsv() {{
+        window.location.href = '/admin/api/roulette/payout.csv';
+      }}
+
+      function downloadPayoutCsv() {{
+        const weekKey = document.getElementById('weekKeyInput').value.trim();
+        if (!weekKey) {{
+          window.location.href = '/admin/api/roulette/payout.csv';
+          return;
+        }}
+        window.location.href = '/admin/api/roulette/payout.csv?week_key=' + encodeURIComponent(weekKey);
+      }}
+
+      loadRouletteSettings();
+      loadRouletteHistory();
+    </script>
+    """
+    return html_page("룰렛 관리자", body)
 
 
 @app.get("/admin/api/roulette/history")
