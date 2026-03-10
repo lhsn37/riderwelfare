@@ -523,8 +523,12 @@ def save_attendance_map(data: Dict[str, Any]) -> None:
 def _att_get_record(att_map: Dict[str, Any], login_key: str) -> Dict[str, Any]:
     rec = att_map.get(login_key)
     if isinstance(rec, dict):
+        rec.setdefault("period_start", "")
+        rec.setdefault("period_end", "")
+        rec.setdefault("days", [])
+        rec.setdefault("sticker", False)
         return rec
-    return {"period_start": "", "period_end": "", "days": []}
+    return {"period_start": "", "period_end": "", "days": [], "sticker": False}
 
 
 def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl: date) -> Tuple[int, int, bool]:
@@ -554,11 +558,12 @@ def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl:
         return 0, get_prevplus(login_key), False
 
     # 기간 변경 -> 현재기간 플러스 전체를 이전등급 플러스로 이관
+    old_prev_plus = get_prevplus(login_key)
     old_planned_plus = get_plannedplus(login_key)
     old_sticker_bonus = get_sticker_bonus(login_key)
     moved_bonus = int(old_planned_plus or 0) + int(old_sticker_bonus or 0)
 
-    set_prevplus(login_key, moved_bonus)
+    set_prevplus(login_key, old_prev_plus + moved_bonus)
     set_plannedplus(login_key, 0)
 
     # 새 기간으로 출석기록 초기화
@@ -1129,16 +1134,7 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     login_key = f"{name_in}|{rider_login4}"
 
-    login4, _, login_src = get_login4_for_rider(rr)
-    real_key = f"{nn}|{real4}"
-    login_key = f"{nn}|{login4}"
-
-    eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
-
-    cur_start, cur_end_incl = current_period(eff_join, today)
     attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
-
-    cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
     ds = fetch_delivery_status_cached()
     stats_map = build_today_stats_map(ds)
@@ -1157,7 +1153,7 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     planned_plus = get_plannedplus(login_key)
     set_plannedplus(login_key, planned_plus + ATTENDANCE_BONUS_PER_DAY)
 
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
 
 
 @app.post("/roulette-spin")
@@ -2299,6 +2295,7 @@ def dashboard(request: Request, q: str = ""):
         eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
 
         cur_start, cur_end_incl = current_period(eff_join, today)
+        attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -2358,7 +2355,7 @@ def dashboard(request: Request, q: str = ""):
             planned_grade = grade_from_total(planned_total)
             current_grade = grade_from_total(prev_total)
 
-            nxt, remain = next_grade_target(cur_completed_raw)
+            nxt, remain = next_grade_target(planned_total)
 
             ov = join_overrides.get(it["login_key"])
             join_default_val = ov if ov else it["eff_join"].isoformat()
