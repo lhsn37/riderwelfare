@@ -301,6 +301,8 @@ def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
     api_max = date.today() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
+    if from_d > to_d:
+        from_d = to_d
     return from_d, to_d
 
 
@@ -539,12 +541,12 @@ def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl:
         return 0, get_prevplus(login_key), False
 
     # 기간 변경 -> 현재기간 플러스 전체를 이전등급 플러스로 이관
-    old_prev_plus = get_prevplus(login_key)
     old_planned_plus = get_plannedplus(login_key)
     old_sticker_bonus = get_sticker_bonus(login_key)
     moved_bonus = int(old_planned_plus or 0) + int(old_sticker_bonus or 0)
 
-    set_prevplus(login_key, old_prev_plus + moved_bonus)
+    prev_now = get_prevplus(login_key)
+    set_prevplus(login_key, prev_now + moved_bonus)
     set_plannedplus(login_key, 0)
 
     # 새 기간으로 출석기록 초기화
@@ -683,9 +685,6 @@ def fetch_riders_cached() -> List[Dict[str, Any]]:
 
 
 def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
-    if from_d > to_d:
-        return {}
-
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     now = time.time()
     cached = _status_cache.get(key)
@@ -707,9 +706,6 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
 
 
 def has_status_range(from_d: date, to_d: date) -> bool:
-    if from_d > to_d:
-        return False
-
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     all_status = _read_json(STATUS_STORE, {}) or {}
     return isinstance(all_status, dict) and (key in all_status)
@@ -948,7 +944,7 @@ def ingest_ranges(request: Request):
         login4, _, _ = get_login4_for_rider(rr)
         eff_join, _ = get_effective_join_date_by_login_key(rr, login4)
 
-        cur_start, cur_end_incl = current_period(eff_join, effective_today)
+        cur_start, cur_end_incl = current_period(eff_join, today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -1080,7 +1076,7 @@ def admin_help():
       </div>
 
       <div style="margin-top:14px;">
-        <a href="/" style="text-decoration:none; color:#111;">← 조회 화면으로</a>
+        <a href="/" style="text-decoration:none; color:#111;">&larr; 조회 화면으로</a>
       </div>
     </div>
     """
@@ -1117,31 +1113,39 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    real_today = date.today()
-    effective_today = real_today - timedelta(days=1)
-    cur_start, cur_end_incl = current_period(eff_join_date, effective_today)
+    today = date.today()
+    cur_start, cur_end_incl = current_period(eff_join_date, today)
     login_key = f"{name_in}|{rider_login4}"
 
+    login4, _, login_src = get_login4_for_rider(rr)
+    real_key = f"{nn}|{real4}"
+    login_key = f"{nn}|{login4}"
+
+    eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
+
+    cur_start, cur_end_incl = current_period(eff_join, today)
     attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
+
+    cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
     ds = fetch_delivery_status_cached()
     stats_map = build_today_stats_map(ds)
     today_completed = int((stats_map.get(f"{name_in}|{rider_real4}") or {}).get("complete") or 0)
 
     if today_completed < ATTENDANCE_MIN_TODAY_COMPLETE:
-        return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
-    if attendance_is_checked_today(login_key, real_today, cur_start, cur_end_incl):
-        return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
+    if attendance_is_checked_today(login_key, today, cur_start, cur_end_incl):
+        return RedirectResponse("/", status_code=303)
 
     ok = attendance_mark_today(login_key, today, cur_start, cur_end_incl)
     if not ok:
-        return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
     planned_plus = get_plannedplus(login_key)
     set_plannedplus(login_key, planned_plus + ATTENDANCE_BONUS_PER_DAY)
 
-    return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.post("/roulette-spin")
@@ -1201,7 +1205,7 @@ def check(
         <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:520px; margin:0 auto;">
           <h3 style="margin-top:0;">요청이 너무 많습니다</h3>
           <div style="color:#666;">잠시 후 다시 시도해주세요.</div>
-          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 뒤로</a></div>
+          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">&larr; 뒤로</a></div>
         </div>
         """
         return html_page("제한됨", body)
@@ -1214,7 +1218,7 @@ def check(
         <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:520px; margin:0 auto;">
           <h3 style="margin-top:0;">입력 오류</h3>
           <div style="color:#666;">뒷 4자리는 숫자 4자리로 입력해주세요.</div>
-          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 뒤로</a></div>
+          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">&larr; 뒤로</a></div>
         </div>
         """
         return html_page("입력 오류", body)
@@ -1233,7 +1237,7 @@ def check(
           <h3 style="margin-top:0;">조회 결과 없음</h3>
           <div style="color:#666;">입력: <b>{name}</b> / <b>{login4}</b></div>
           <div style="color:#888; margin-top:8px; font-size:13px;">이름(띄어쓰기/철자) 또는 로그인용 뒷4를 확인해주세요.</div>
-          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 다시 조회</a></div>
+          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">&larr; 다시 조회</a></div>
         </div>
         """
         return html_page("조회 결과 없음", body)
@@ -1243,7 +1247,7 @@ def check(
         <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:520px; margin:0 auto;">
           <h3 style="margin-top:0;">동일 정보 다수</h3>
           <div style="color:#666;">동일 이름/로그인용뒷4가 여러 명입니다. 관리자에게 문의해주세요.</div>
-          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">← 뒤로</a></div>
+          <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">&larr; 뒤로</a></div>
         </div>
         """
         return html_page("동일 정보 다수", body)
@@ -1599,7 +1603,7 @@ def check(
             height:0;
             border-left:18px solid transparent;
             border-right:18px solid transparent;
-            border-top:34px solid #ef4444;
+            border-bottom:34px solid #ef4444;
             z-index:4;
             filter:drop-shadow(0 3px 3px rgba(0,0,0,0.16));
           "></div>
@@ -1897,16 +1901,10 @@ def check(
       }}
 
       const reward = Number(data.reward || 0);
-      const targetAngle = rewardToStopAngle(reward);
+      const stopAngle = rewardToStopAngle(reward);
       const extraSpins = 360 * 7;
 
-      const currentAngle = ((rouletteCurrentRotation % 360) + 360) % 360;
-      let delta = (targetAngle - currentAngle + 360) % 360;
-      if (delta < 180) {{
-        delta += 360;
-      }}
-
-      rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + delta;
+      rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + stopAngle;
       wheel.style.transform = `rotate(${{rouletteCurrentRotation}}deg)`;
 
       setTimeout(() => {{
@@ -1941,7 +1939,7 @@ def check(
       </div>
 
       <div style="margin-top:14px;">
-        <a href="/" style="text-decoration:none; color:#111;">← 다시 조회</a>
+        <a href="/" style="text-decoration:none; color:#111;">&larr; 다시 조회</a>
       </div>
     </div>
     """
@@ -1966,7 +1964,7 @@ def admin_login_page():
         </button>
       </form>
       <div style="margin-top:12px;">
-        <a href="/" style="color:#666; text-decoration:none;">← 메인으로</a>
+        <a href="/" style="color:#666; text-decoration:none;">&larr; 메인으로</a>
       </div>
     </div>
     """
@@ -1984,7 +1982,7 @@ def admin_login_action(request: Request, password: str = Form(...)):
       <h3 style="margin-top:0;">비밀번호가 틀렸습니다</h3>
       <div style="color:#666;">다시 시도해주세요.</div>
       <div style="margin-top:12px;"><a href="/admin-login" style="text-decoration:none; color:#111;">다시 로그인</a></div>
-      <div style="margin-top:10px;"><a href="/" style="text-decoration:none; color:#666;">← 메인으로</a></div>
+      <div style="margin-top:10px;"><a href="/" style="text-decoration:none; color:#666;">&larr; 메인으로</a></div>
     </div>
     """
     return HTMLResponse(html_page("로그인 실패", body))
@@ -2105,12 +2103,13 @@ def admin_set_plannedplus(request: Request, key: str = Form(...), plannedplus: s
     set_plannedplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
+
 @app.post("/admin/set-sticker")
 def admin_set_sticker(
     request: Request,
     key: str = Form(...),
     sticker_attached: str = Form(default="0"),
-    redirect_q: str = Form(default="")
+    redirect_q: str = Form(default=""),
 ):
     r = require_admin(request)
     if r:
@@ -2204,7 +2203,7 @@ async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)
         <div style="max-width:640px; margin:40px auto; background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:20px;">
           <h3 style="margin-top:0;">업로드 실패</h3>
           <div style="color:#666;">xlsx 파일만 업로드할 수 있습니다.</div>
-          <div style="margin-top:12px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+          <div style="margin-top:12px;"><a href="/dashboard" style="text-decoration:none; color:#111;">&larr; 대시보드로 돌아가기</a></div>
         </div>
         """
         return HTMLResponse(html_page("업로드 실패", body))
@@ -2221,7 +2220,7 @@ async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)
             저장된 키 수: <b>{saved_count}</b><br/>
             이전등급 플러스 / 예정등급 플러스가 모두 갱신되었습니다.
           </div>
-          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">&larr; 대시보드로 돌아가기</a></div>
         </div>
         """
         return HTMLResponse(html_page("플러스 복원 완료", body))
@@ -2234,7 +2233,7 @@ async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)
             오류: <b>{str(e)}</b><br/>
             업로드 엑셀에 <b>name / login4 / prev_plus / planned_plus</b> 컬럼이 있어야 합니다.
           </div>
-          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
+          <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">&larr; 대시보드로 돌아가기</a></div>
         </div>
         """
         return HTMLResponse(html_page("플러스 복원 실패", body))
@@ -2269,7 +2268,7 @@ def dashboard(request: Request, q: str = ""):
             continue
         rider_rows.append(rr)
 
-    effective_today = date.today() - timedelta(days=1)
+    today = date.today()
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
 
@@ -2288,7 +2287,7 @@ def dashboard(request: Request, q: str = ""):
 
         eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
 
-        cur_start, cur_end_incl = current_period(eff_join, effective_today)
+        cur_start, cur_end_incl = current_period(eff_join, today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -2569,15 +2568,6 @@ def dashboard(request: Request, q: str = ""):
                 <button type="submit" style="padding:8px 10px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">초기화</button>
               </form>
             </div>
-            <form method="post" action="/admin/set-sticker" style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <input type="hidden" name="key" value="{it['login_key']}" />
-              <input type="hidden" name="redirect_q" value="{q}" />
-              <label style="display:flex; gap:6px; align-items:center; font-size:14px; color:#111;">
-                <input type="checkbox" name="sticker_attached" value="1" {'checked' if it['sticker_attached'] else ''} />
-                스티커부착자 (+20)
-              </label>
-              <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
-            </form>
           </td>
         </tr>
         """
@@ -2688,7 +2678,7 @@ def dashboard_excel(request: Request):
     plannedplus_map = load_plannedplus_map()
     today_stats_map = build_today_stats_map(fetch_delivery_status_cached())
 
-    effective_today = date.today() - timedelta(days=1)
+    today = date.today()
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
 
@@ -2902,8 +2892,8 @@ def admin_roulette_page(request: Request):
         <div>
           <h2 style="margin:0 0 6px 0;">룰렛 관리자</h2>
           <div style="color:#666; line-height:1.7;">
-            현재 운영주차: <b>{current_cycle['display_start']}</b> ~ <b>{current_cycle['display_end']}</b><br/>
-            직전 마감 주차: <b>{prev_cycle['display_start']}</b> ~ <b>{prev_cycle['display_end']}</b>
+            현재 운영주차: <b>{current_cycle["display_start"]}</b> ~ <b>{current_cycle["display_end"]}</b><br/>
+            직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b>
           </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -2916,7 +2906,9 @@ def admin_roulette_page(request: Request):
 
       <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
         <div style="font-weight:900; margin-bottom:10px;">룰렛 복원 업로드</div>
-        <div style="color:#666; font-size:13px; line-height:1.6; margin-bottom:10px;">export JSON 또는 백업 JSON 파일을 업로드해서 룰렛 설정/당첨내역을 복원합니다.</div>
+        <div style="color:#666; font-size:13px; line-height:1.6; margin-bottom:10px;">
+          export JSON 또는 백업 JSON 파일을 업로드해서 룰렛 설정/당첨내역을 복원합니다.
+        </div>
         <form id="rouletteImportForm" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input type="file" id="rouletteImportFile" name="file" accept=".json" style="font-size:14px;" />
           <button type="button" onclick="importRouletteJson()" style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">업로드 복원</button>
@@ -2955,7 +2947,6 @@ def admin_roulette_page(request: Request):
             <button onclick="downloadPayoutCsv()" style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">주차 지정 CSV</button>
             <button onclick="downloadPrevPayoutCsv()" style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">직전주 CSV</button>
           </div>
-          <div style="margin-top:8px; color:#888; font-size:12px;">비워두면 직전 마감 운영주차 기준으로 다운로드됩니다.</div>
         </div>
       </div>
 
@@ -2972,12 +2963,14 @@ def admin_roulette_page(request: Request):
           <div style="font-weight:900;">당첨 내역</div>
           <div id="historySummary" style="color:#666; font-size:13px;"></div>
         </div>
+
         <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input type="date" id="startDate" style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
           <input type="date" id="endDate" style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
           <input type="text" id="keyword" placeholder="이름 또는 전화번호" style="width:220px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
           <button onclick="loadRouletteHistory()" style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">조회</button>
         </div>
+
         <div style="margin-top:12px; overflow:auto; border:1px solid #eee; border-radius:12px;">
           <table style="border-collapse:collapse; width:100%; min-width:1100px;">
             <thead>
@@ -2996,9 +2989,7 @@ def admin_roulette_page(request: Request):
                 <th style="padding:10px; border-bottom:1px solid #eee;">삭제</th>
               </tr>
             </thead>
-            <tbody id="historyBody">
-              <tr><td colspan="12" style="padding:14px; color:#777;">불러오는 중...</td></tr>
-            </tbody>
+            <tbody id="historyBody"><tr><td colspan="12" style="padding:14px; color:#777;">불러오는 중...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -3016,12 +3007,18 @@ def admin_roulette_page(request: Request):
         document.getElementById('spinUnit').value = data.spin_unit || 10;
         document.getElementById('maxSegmentValue').value = data.max_segment_value || 100;
         const grouped = {{}};
-        (data.segment_rewards || []).forEach(r => {{ const seg = Number(r.segment_value || 0); if (!grouped[seg]) grouped[seg] = []; grouped[seg].push(r); }});
+        (data.segment_rewards || []).forEach(r => {{
+          const seg = Number(r.segment_value || 0);
+          if (!grouped[seg]) grouped[seg] = [];
+          grouped[seg].push(r);
+        }});
         const wrap = document.getElementById('segmentRewardWrap');
         let html = `<table style="border-collapse:collapse; width:100%; min-width:900px;"><thead><tr style="background:#fafafa;"><th style="padding:10px; border-bottom:1px solid #eee;">구간</th><th style="padding:10px; border-bottom:1px solid #eee;">1000원</th><th style="padding:10px; border-bottom:1px solid #eee;">2000원</th><th style="padding:10px; border-bottom:1px solid #eee;">3000원</th><th style="padding:10px; border-bottom:1px solid #eee;">5000원</th><th style="padding:10px; border-bottom:1px solid #eee;">10000원</th></tr></thead><tbody>`;
         const amounts = [1000, 2000, 3000, 5000, 10000];
         segmentList().forEach(seg => {{
-          const rows = grouped[seg] || []; const byAmount = {{}}; rows.forEach(r => byAmount[Number(r.amount)] = r);
+          const rows = grouped[seg] || [];
+          const byAmount = {{}};
+          rows.forEach(r => byAmount[Number(r.amount)] = r);
           html += `<tr><td style="padding:10px; border-bottom:1px solid #eee; font-weight:900;">${{seg}}건</td>`;
           amounts.forEach(amount => {{
             const row = byAmount[amount] || {{ weight: 0, active: 1 }};
@@ -3046,7 +3043,11 @@ def admin_roulette_page(request: Request):
             payloadRows.push({{ segment_value: seg, amount: amount, weight: Number(w?.value || 0), active: !!a?.checked, sort_order: idx + 1 }});
           }});
         }});
-        const res = await fetch('/admin/api/roulette/settings', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ enabled, spin_unit, max_segment_value, segment_rewards: payloadRows }}) }});
+        const res = await fetch('/admin/api/roulette/settings', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ enabled, spin_unit, max_segment_value, segment_rewards: payloadRows }})
+        }});
         const data = await res.json();
         document.getElementById('saveMsg').innerText = data.ok ? '저장 완료' : (data.detail || '저장 실패');
         if (data.ok) loadRouletteSettings();
@@ -3067,7 +3068,10 @@ def admin_roulette_page(request: Request):
         const summary = document.getElementById('historySummary');
         summary.innerText = `조회건수 ${{Number(data.summary?.count || 0)}}건 / 총 당첨금 ${{fmtMoney(data.summary?.total_amount || 0)}}`;
         const rows = data.rows || [];
-        if (!rows.length) {{ tbody.innerHTML = '<tr><td colspan="12" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>'; return; }}
+        if (!rows.length) {{
+          tbody.innerHTML = '<tr><td colspan="12" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>';
+          return;
+        }}
         let html = '';
         rows.forEach(row => {{
           html += `<tr><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.id}}</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_date || '-'}} </td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{fmtTs(row.created_at)}}</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.rider_name || ''}}</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.phone || ''}}</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.today_completed || 0}}</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_index || 0}}회차</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.segment_value || 0}}건</td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;"><input type="number" id="amt_${{row.id}}" value="${{row.reward_amount || 0}}" style="width:100px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" /></td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;"><input type="text" id="note_${{row.id}}" value="${{row.note || ''}}" style="width:180px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" /></td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;"><button onclick="updateRouletteSpin(${{row.id}})" style="padding:8px 12px; border:none; border-radius:10px; background:#111; color:#fff;">수정</button></td><td style="padding:10px; border-bottom:1px solid #eee; text-align:center;"><button onclick="deleteRouletteSpin(${{row.id}})" style="padding:8px 12px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">삭제</button></td></tr>`;
@@ -3099,15 +3103,51 @@ def admin_roulette_page(request: Request):
       }}
 
       function downloadPrevPayoutCsv() {{ window.location.href = '/admin/api/roulette/payout.csv'; }}
-      function downloadPayoutCsv() {{ const weekKey = document.getElementById('weekKeyInput').value.trim(); if (!weekKey) {{ window.location.href = '/admin/api/roulette/payout.csv'; return; }} window.location.href = '/admin/api/roulette/payout.csv?week_key=' + encodeURIComponent(weekKey); }}
-      function downloadRouletteHistoryCsv() {{ const start_date = document.getElementById('startDate').value; const end_date = document.getElementById('endDate').value; const keyword = document.getElementById('keyword').value.trim(); const qs = new URLSearchParams(); if (start_date) qs.set('start_date', start_date); if (end_date) qs.set('end_date', end_date); if (keyword) qs.set('keyword', keyword); qs.set('limit', '5000'); window.location.href = '/admin/api/roulette/history.csv?' + qs.toString(); }}
-      async function importRouletteJson() {{ const fileInput = document.getElementById('rouletteImportFile'); const msg = document.getElementById('rouletteImportMsg'); if (!fileInput.files || !fileInput.files.length) {{ msg.innerText = '업로드할 json 파일을 선택하세요.'; return; }} const formData = new FormData(); formData.append('file', fileInput.files[0]); msg.innerText = '업로드 중...'; try {{ const res = await fetch('/admin/api/roulette/import', {{ method: 'POST', body: formData }}); const data = await res.json(); if (!res.ok || !data.ok) throw new Error(data.detail || '복원 실패'); msg.innerText = `복원 완료 / 스핀 ${{Number(data.restored_spins || 0)}}건 / 확률행 ${{Number(data.segment_reward_rows || 0)}}건`; loadRouletteSettings(); loadRouletteHistory(); }} catch (e) {{ msg.innerText = e.message || '복원 실패'; }} }}
+      function downloadPayoutCsv() {{
+        const weekKey = document.getElementById('weekKeyInput').value.trim();
+        if (!weekKey) {{
+          window.location.href = '/admin/api/roulette/payout.csv';
+          return;
+        }}
+        window.location.href = '/admin/api/roulette/payout.csv?week_key=' + encodeURIComponent(weekKey);
+      }}
+      function downloadRouletteHistoryCsv() {{
+        const start_date = document.getElementById('startDate').value;
+        const end_date = document.getElementById('endDate').value;
+        const keyword = document.getElementById('keyword').value.trim();
+        const qs = new URLSearchParams();
+        if (start_date) qs.set('start_date', start_date);
+        if (end_date) qs.set('end_date', end_date);
+        if (keyword) qs.set('keyword', keyword);
+        qs.set('limit', '5000');
+        window.location.href = '/admin/api/roulette/history.csv?' + qs.toString();
+      }}
+      async function importRouletteJson() {{
+        const fileInput = document.getElementById('rouletteImportFile');
+        const msg = document.getElementById('rouletteImportMsg');
+        if (!fileInput.files || !fileInput.files.length) {{
+          msg.innerText = '업로드할 json 파일을 선택하세요.';
+          return;
+        }}
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        msg.innerText = '업로드 중...';
+        try {{
+          const res = await fetch('/admin/api/roulette/import', {{ method: 'POST', body: formData }});
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.detail || '복원 실패');
+          msg.innerText = `복원 완료 / 스핀 ${{Number(data.restored_spins || 0)}}건 / 확률행 ${{Number(data.segment_reward_rows || 0)}}건`;
+          loadRouletteSettings();
+          loadRouletteHistory();
+        }} catch (e) {{
+          msg.innerText = e.message || '복원 실패';
+        }}
+      }}
       loadRouletteSettings();
       loadRouletteHistory();
     </script>
     """
     return html_page("룰렛 관리자", body)
-
 
 @app.get("/admin/api/roulette/history")
 def admin_get_roulette_history(
@@ -3170,6 +3210,7 @@ def admin_roulette_backup(request: Request):
     r = require_admin(request)
     if r:
         raise HTTPException(status_code=401, detail="admin required")
+
     try:
         return roulette_db.create_backup()
     except Exception as e:
@@ -3192,20 +3233,28 @@ def admin_roulette_export(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/admin/api/roulette/import")
 async def admin_roulette_import(request: Request, file: UploadFile = File(...)):
     r = require_admin(request)
     if r:
         raise HTTPException(status_code=401, detail="admin required")
+
     try:
-        if not file.filename.lower().endswith('.json'):
-            raise HTTPException(status_code=400, detail='json 파일만 업로드 가능합니다.')
+        if not file.filename.lower().endswith(".json"):
+            raise HTTPException(status_code=400, detail="json 파일만 업로드 가능합니다.")
+
         backup_info = roulette_db.create_backup()
+
         raw = await file.read()
-        payload = json.loads(raw.decode('utf-8'))
+        payload = json.loads(raw.decode("utf-8"))
+
         result = roulette_db.import_json(payload)
-        return {"ok": True, "filename": file.filename, "backup_name": backup_info.get('backup_name', ''), **result}
+        return {
+            "ok": True,
+            "filename": file.filename,
+            "backup_name": backup_info.get("backup_name", ""),
+            **result,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -3223,24 +3272,63 @@ def admin_roulette_history_csv(
     r = require_admin(request)
     if r:
         raise HTTPException(status_code=401, detail="admin required")
+
     try:
-        rows = roulette_db.get_history(start_date=start_date or None, end_date=end_date or None, keyword=keyword or "", limit=limit)
+        rows = roulette_db.get_history(
+            start_date=start_date or None,
+            end_date=end_date or None,
+            keyword=keyword or "",
+            limit=limit,
+        )
+
         output = StringIO()
         writer = csv.writer(output)
-        writer.writerow(["id", "spin_date", "time", "rider_name", "phone", "today_completed", "spin_index", "segment_value", "reward_amount", "note", "created_at"])
+        writer.writerow([
+            "id",
+            "spin_date",
+            "time",
+            "rider_name",
+            "phone",
+            "today_completed",
+            "spin_index",
+            "segment_value",
+            "reward_amount",
+            "note",
+            "created_at",
+        ])
+
         for row in rows:
-            created_at = int(row.get('created_at') or 0)
-            time_text = '-'
+            created_at = int(row.get("created_at") or 0)
+            time_text = "-"
             if created_at:
                 try:
-                    time_text = time.strftime('%H:%M:%S', time.localtime(created_at))
+                    time_text = time.strftime("%H:%M:%S", time.localtime(created_at))
                 except Exception:
-                    time_text = '-'
-            writer.writerow([row.get('id',''), row.get('spin_date',''), time_text, row.get('rider_name',''), row.get('phone',''), row.get('today_completed',0), row.get('spin_index',0), row.get('segment_value',0), row.get('reward_amount',0), row.get('note',''), row.get('created_at',0)])
-        s = start_date or 'all'
-        e = end_date or 'all'
-        filename = f'roulette_history_{s}_{e}.csv'
-        return Response(content=output.getvalue(), media_type='text/csv; charset=utf-8-sig', headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+                    time_text = "-"
+
+            writer.writerow([
+                row.get("id", ""),
+                row.get("spin_date", ""),
+                time_text,
+                row.get("rider_name", ""),
+                row.get("phone", ""),
+                row.get("today_completed", 0),
+                row.get("spin_index", 0),
+                row.get("segment_value", 0),
+                row.get("reward_amount", 0),
+                row.get("note", ""),
+                row.get("created_at", 0),
+            ])
+
+        s = start_date or "all"
+        e = end_date or "all"
+        filename = f"roulette_history_{s}_{e}.csv"
+
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv; charset=utf-8-sig",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3259,12 +3347,11 @@ def admin_roulette_payout_csv(request: Request, week_key: str = ""):
         writer = csv.writer(output)
         writer.writerow(["주차키", "이름", "전화번호", "룰렛횟수", "지급금액"])
         for row in rows:
-            writer.writerow([week_key, row.get('rider_name',''), row.get('phone',''), row.get('spin_count',0), row.get('total_amount',0)])
-        filename = f'roulette_payout_{week_key}.csv'
-        return Response(content=output.getvalue(), media_type='text/csv; charset=utf-8-sig', headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+            writer.writerow([week_key, row.get("rider_name",""), row.get("phone",""), row.get("spin_count",0), row.get("total_amount",0)])
+        filename = f"roulette_payout_{week_key}.csv"
+        return Response(content=output.getvalue(), media_type="text/csv; charset=utf-8-sig", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # -----------------------------
 # Diagnostics
