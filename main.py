@@ -2322,13 +2322,22 @@ def dashboard(request: Request, q: str = ""):
 
     prev_completed_map: Dict[str, int] = {}
     for (from_d, to_d), items in prev_group.items():
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
-        for it in items:
+        if from_d > to_d:
+            for it in items:
+                prev_completed_map[it["real_key"]] = 0
+            continue
+
+    cmap = fetch_status_complete_map_cached(from_d, to_d)
+    for it in items:
             prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
 
     final_rows = []
     for (from_d, to_d), items in cur_group.items():
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        if from_d > to_d:
+            cmap = {}
+        else:
+            cmap = fetch_status_complete_map_cached(from_d, to_d)
+
         for it in items:
             rr = it["rider"]
             nm = rr.get("name") or ""
@@ -2336,7 +2345,6 @@ def dashboard(request: Request, q: str = ""):
             created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
 
             cur_completed_raw = int(cmap.get(it["real_key"], 0))
-            prev_completed_raw = int(prev_completed_map.get(it["real_key"], 0))
 
             prev_plus = get_prevplus(it["login_key"])
             planned_plus_base = get_plannedplus(it["login_key"])
@@ -2738,13 +2746,22 @@ def dashboard_excel(request: Request):
 
     prev_completed_map: Dict[str, int] = {}
     for (from_d, to_d), items in prev_group.items():
+        if from_d > to_d:
+            for it in items:
+                prev_completed_map[it["real_key"]] = 0
+            continue
+
         cmap = fetch_status_complete_map_cached(from_d, to_d)
         for it in items:
             prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
 
     rows = []
     for (from_d, to_d), items in cur_group.items():
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        if from_d > to_d:
+            cmap = {}
+        else:
+            cmap = fetch_status_complete_map_cached(from_d, to_d)
+
         for it in items:
             cur_raw = int(cmap.get(it["real_key"], 0))
             prev_raw = int(prev_completed_map.get(it["real_key"], 0))
