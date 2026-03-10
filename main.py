@@ -2916,14 +2916,15 @@ def admin_roulette_page(request: Request):
             export JSON 또는 백업 JSON 파일을 업로드해서 룰렛 설정/당첨내역을 복원합니다.
           </div>
 
-        <form id="rouletteImportForm" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="file" id="rouletteImportFile" name="file" accept=".json"
-                 style="font-size:14px;" />
-          <button type="button" onclick="importRouletteJson()"
-                  style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
-            업로드 복원
-        </button>
-      </form>
+        <form method="post" action="/admin/api/roulette/import" enctype="multipart/form-data"
+                     style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input type="file" id="rouletteImportFile" name="file" accept=".json"
+                       style="font-size:14px;" required />
+            <button type="submit"
+                         style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900; cursor:pointer;">
+                업로드 복원
+             </button>
+         </form>
 
   <div id="rouletteImportMsg" style="margin-top:10px; color:#666; font-size:13px;"></div>
 </div>
