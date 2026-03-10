@@ -301,8 +301,6 @@ def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
     api_max = date.today() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
-    if from_d > to_d:
-        from_d = to_d
     return from_d, to_d
 
 
@@ -1255,9 +1253,18 @@ def check(
     prev_start = clamp_day(prev_m.year, prev_m.month, eff_join_date.day)
     prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
-    cmap_cur = fetch_status_complete_map_cached(cur_from, cur_to)
-    cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
+    if cur_from > cur_to:
+        cur_completed_raw = 0
+    else:
+        cmap_cur = fetch_status_complete_map_cached(cur_from, cur_to)
+        cur_completed_raw = int(cmap_cur.get(api_key, 0))
 
+    if prev_from > prev_to:
+        prev_completed_raw = 0
+    else:
+        cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
+        prev_completed_raw = int(cmap_prev.get(api_key, 0))
+  
     api_key = f"{name_in}|{rider_real4}"
     cur_completed_raw = int(cmap_cur.get(api_key, 0))
     prev_completed_raw = int(cmap_prev.get(api_key, 0))
