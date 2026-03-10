@@ -2557,6 +2557,15 @@ def dashboard(request: Request, q: str = ""):
                 <button type="submit" style="padding:8px 10px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">초기화</button>
               </form>
             </div>
+            <form method="post" action="/admin/set-sticker" style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <input type="hidden" name="key" value="{it['login_key']}" />
+              <input type="hidden" name="redirect_q" value="{q}" />
+              <label style="display:flex; gap:6px; align-items:center; font-size:14px; color:#111;">
+                <input type="checkbox" name="sticker_attached" value="1" {'checked' if it['sticker_attached'] else ''} />
+                스티커부착자 (+20)
+              </label>
+              <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
+            </form>
           </td>
         </tr>
         """
