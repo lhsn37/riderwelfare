@@ -1891,11 +1891,22 @@ def check(
       }}
 
       const reward = Number(data.reward || 0);
-      const stopAngle = rewardToStopAngle(reward);
+      const targetAngle = rewardToStopAngle(reward);
       const extraSpins = 360 * 7;
 
-      rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + stopAngle;
-      wheel.style.transform = `rotate(${{rouletteCurrentRotation}}deg)`;
+      // 현재 휠이 어디를 보고 있는지 0~359도로 정규화
+      const currentAngle = ((rouletteCurrentRotation % 360) + 360) % 360;
+
+      // 현재 각도에서 목표 각도까지 "앞으로" 얼마나 더 돌아야 하는지 계산
+      let delta = (targetAngle - currentAngle + 360) % 360;
+
+      // 너무 짧게 돌면 어색하니까 최소 1바퀴는 더 돌게
+      if (delta < 180) {
+        delta += 360;
+      }
+
+      rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + delta;
+      wheel.style.transform = `rotate(${rouletteCurrentRotation}deg)`;
 
       setTimeout(() => {{
         makeConfetti();
