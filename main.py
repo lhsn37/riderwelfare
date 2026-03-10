@@ -314,8 +314,6 @@ def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
     api_max = date.today() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
-    if from_d > to_d:
-        from_d = to_d
     return from_d, to_d
 
 
@@ -702,6 +700,9 @@ def fetch_riders_cached() -> List[Dict[str, Any]]:
 
 
 def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
+    if from_d > to_d:
+        return {}
+
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     now = time.time()
     cached = _status_cache.get(key)
@@ -723,6 +724,9 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
 
 
 def has_status_range(from_d: date, to_d: date) -> bool:
+    if from_d > to_d:
+        return False
+
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     all_status = _read_json(STATUS_STORE, {}) or {}
     return isinstance(all_status, dict) and (key in all_status)
@@ -1648,11 +1652,11 @@ def check(
               0 16px 36px rgba(15,23,42,0.18);
           ">
             <div style="position:absolute; inset:0; border-radius:50%;">
-              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(36deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">1,000원</div>
-              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(108deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">2,000원</div>
-              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(180deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">3,000원</div>
-              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(252deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">5,000원</div>
-              <div style="position:absolute; left:50%; top:18px; transform:translateX(-50%) rotate(324deg); transform-origin:center 138px; font-weight:900; font-size:18px; color:#344054;">10,000원</div>
+              <div style="position:absolute; left:50%; top:34px; transform:translateX(-50%) rotate(36deg); transform-origin:center 112px; font-weight:900; font-size:16px; color:#344054;">1,000원</div>
+              <div style="position:absolute; left:50%; top:34px; transform:translateX(-50%) rotate(108deg); transform-origin:center 112px; font-weight:900; font-size:16px; color:#344054;">2,000원</div>
+              <div style="position:absolute; left:50%; top:34px; transform:translateX(-50%) rotate(180deg); transform-origin:center 112px; font-weight:900; font-size:16px; color:#344054;">3,000원</div>
+              <div style="position:absolute; left:50%; top:34px; transform:translateX(-50%) rotate(252deg); transform-origin:center 112px; font-weight:900; font-size:16px; color:#344054;">5,000원</div>
+              <div style="position:absolute; left:50%; top:34px; transform:translateX(-50%) rotate(324deg); transform-origin:center 112px; font-weight:900; font-size:16px; color:#344054;">10,000원</div>
             </div>
 
             <div style="
@@ -1746,13 +1750,13 @@ def check(
 
   function rewardToStopAngle(reward) {{
     const map = {{
-      1000: 324,
-      2000: 252,
-      3000: 180,
-      5000: 108,
-      10000: 36
+      1000: 234,
+      2000: 162,
+      3000: 90,
+      5000: 18,
+      10000: 306
     }};
-    return map[reward] ?? 324;
+    return map[reward] ?? 234;
   }}
 
   function makeConfetti() {{
