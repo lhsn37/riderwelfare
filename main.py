@@ -301,8 +301,6 @@ def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
     api_max = date.today() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
-    if from_d > to_d:
-        from_d = to_d
     return from_d, to_d
 
 
@@ -541,11 +539,12 @@ def attendance_rollover_if_needed(login_key: str, cur_start: date, cur_end_incl:
         return 0, get_prevplus(login_key), False
 
     # 기간 변경 -> 현재기간 플러스 전체를 이전등급 플러스로 이관
+    old_prev_plus = get_prevplus(login_key)
     old_planned_plus = get_plannedplus(login_key)
     old_sticker_bonus = get_sticker_bonus(login_key)
     moved_bonus = int(old_planned_plus or 0) + int(old_sticker_bonus or 0)
 
-    set_prevplus(login_key, moved_bonus)
+    set_prevplus(login_key, old_prev_plus + moved_bonus)
     set_plannedplus(login_key, 0)
 
     # 새 기간으로 출석기록 초기화
@@ -684,6 +683,9 @@ def fetch_riders_cached() -> List[Dict[str, Any]]:
 
 
 def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
+    if from_d > to_d:
+        return {}
+
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     now = time.time()
     cached = _status_cache.get(key)
@@ -705,6 +707,9 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
 
 
 def has_status_range(from_d: date, to_d: date) -> bool:
+    if from_d > to_d:
+        return False
+
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     all_status = _read_json(STATUS_STORE, {}) or {}
     return isinstance(all_status, dict) and (key in all_status)
@@ -943,7 +948,7 @@ def ingest_ranges(request: Request):
         login4, _, _ = get_login4_for_rider(rr)
         eff_join, _ = get_effective_join_date_by_login_key(rr, login4)
 
-        cur_start, cur_end_incl = current_period(eff_join, today)
+        cur_start, cur_end_incl = current_period(eff_join, effective_today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -1112,8 +1117,9 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = date.today()
-    cur_start, cur_end_incl = current_period(eff_join_date, today)
+    real_today = date.today()
+    effective_today = real_today - timedelta(days=1)
+    cur_start, cur_end_incl = current_period(eff_join_date, effective_today)
     login_key = f"{name_in}|{rider_login4}"
 
     attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
@@ -1125,7 +1131,7 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     if today_completed < ATTENDANCE_MIN_TODAY_COMPLETE:
         return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
 
-    if attendance_is_checked_today(login_key, today, cur_start, cur_end_incl):
+    if attendance_is_checked_today(login_key, real_today, cur_start, cur_end_incl):
         return RedirectResponse(f"/check-result?name={name}&login4={login4}", status_code=303)
 
     ok = attendance_mark_today(login_key, today, cur_start, cur_end_incl)
@@ -1894,19 +1900,14 @@ def check(
       const targetAngle = rewardToStopAngle(reward);
       const extraSpins = 360 * 7;
 
-      // 현재 휠이 어디를 보고 있는지 0~359도로 정규화
       const currentAngle = ((rouletteCurrentRotation % 360) + 360) % 360;
-
-      // 현재 각도에서 목표 각도까지 "앞으로" 얼마나 더 돌아야 하는지 계산
       let delta = (targetAngle - currentAngle + 360) % 360;
-
-      // 너무 짧게 돌면 어색하니까 최소 1바퀴는 더 돌게
-      if (delta < 180) {
+      if (delta < 180) {{
         delta += 360;
-      }
+      }}
 
       rouletteCurrentRotation = rouletteCurrentRotation + extraSpins + delta;
-      wheel.style.transform = `rotate(${rouletteCurrentRotation}deg)`;
+      wheel.style.transform = `rotate(${{rouletteCurrentRotation}}deg)`;
 
       setTimeout(() => {{
         makeConfetti();
@@ -2268,7 +2269,7 @@ def dashboard(request: Request, q: str = ""):
             continue
         rider_rows.append(rr)
 
-    today = date.today()
+    effective_today = date.today() - timedelta(days=1)
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
 
@@ -2287,7 +2288,7 @@ def dashboard(request: Request, q: str = ""):
 
         eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
 
-        cur_start, cur_end_incl = current_period(eff_join, today)
+        cur_start, cur_end_incl = current_period(eff_join, effective_today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
         prev_end_incl = cur_start - timedelta(days=1)
@@ -2687,7 +2688,7 @@ def dashboard_excel(request: Request):
     plannedplus_map = load_plannedplus_map()
     today_stats_map = build_today_stats_map(fetch_delivery_status_cached())
 
-    today = date.today()
+    effective_today = date.today() - timedelta(days=1)
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
 
