@@ -1112,11 +1112,20 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = date.today() - timedelta(days=1)
+    today = date.today()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     login_key = f"{name_in}|{rider_login4}"
 
+    login4, _, login_src = get_login4_for_rider(rr)
+    real_key = f"{nn}|{real4}"
+    login_key = f"{nn}|{login4}"
+
+    eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
+
+    cur_start, cur_end_incl = current_period(eff_join, today)
     attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
+
+    cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
     ds = fetch_delivery_status_cached()
     stats_map = build_today_stats_map(ds)
