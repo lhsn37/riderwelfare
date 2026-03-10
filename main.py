@@ -1253,6 +1253,8 @@ def check(
     prev_start = clamp_day(prev_m.year, prev_m.month, eff_join_date.day)
     prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
 
+    api_key = f"{name_in}|{rider_real4}"
+
     if cur_from > cur_to:
         cur_completed_raw = 0
     else:
@@ -1264,10 +1266,6 @@ def check(
     else:
         cmap_prev = fetch_status_complete_map_cached(prev_from, prev_to)
         prev_completed_raw = int(cmap_prev.get(api_key, 0))
-  
-    api_key = f"{name_in}|{rider_real4}"
-    cur_completed_raw = int(cmap_cur.get(api_key, 0))
-    prev_completed_raw = int(cmap_prev.get(api_key, 0))
 
     login_key = f"{name_in}|{rider_login4}"
     rolled_bonus, prevplus_after, rolled = attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
@@ -2320,107 +2318,106 @@ def dashboard(request: Request, q: str = ""):
         cur_group.setdefault((cur_from, cur_to), []).append(item)
         prev_group.setdefault((prev_from, prev_to), []).append(item)
 
-    prev_completed_map: Dict[str, int] = {}
-    for (from_d, to_d), items in prev_group.items():
-        if from_d > to_d:
-            for it in items:
-                prev_completed_map[it["real_key"]] = 0
-            continue
+        prev_completed_map: Dict[str, int] = {}
+        for (from_d, to_d), items in prev_group.items():
+            if from_d > to_d:
+                for it in items:
+                    prev_completed_map[it["real_key"]] = 0
+                continue
 
-    cmap = fetch_status_complete_map_cached(from_d, to_d)
-    for it in items:
-            prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
-
-    final_rows = []
-    for (from_d, to_d), items in cur_group.items():
-        if from_d > to_d:
-            cmap = {}
-        else:
             cmap = fetch_status_complete_map_cached(from_d, to_d)
+            for it in items:
+                prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
 
-        for it in items:
-            rr = it["rider"]
-            nm = rr.get("name") or ""
-            created_raw = rr.get("createdDate")
-            created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
+        final_rows = []
+        for (from_d, to_d), items in cur_group.items():
+            if from_d > to_d:
+                cmap = {}
+            else:
+                cmap = fetch_status_complete_map_cached(from_d, to_d)
 
-            cur_completed_raw = int(cmap.get(it["real_key"], 0))
+            for it in items:
+                rr = it["rider"]
+                nm = rr.get("name") or ""
+                created_raw = rr.get("createdDate")
+                created_d = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else "-"
 
-            prev_plus = get_prevplus(it["login_key"])
-            planned_plus_base = get_plannedplus(it["login_key"])
-            sticker_bonus = get_sticker_bonus(it["login_key"])
-            planned_plus = planned_plus_base + sticker_bonus
+                cur_completed_raw = int(cmap.get(it["real_key"], 0))
+                prev_completed_raw = int(prev_completed_map.get(it["real_key"], 0))
 
-            planned_total = cur_completed_raw + planned_plus
-            prev_total = prev_completed_raw + prev_plus
+                prev_plus = get_prevplus(it["login_key"])
+                planned_plus_base = get_plannedplus(it["login_key"])
+                sticker_bonus = get_sticker_bonus(it["login_key"])
+                planned_plus = planned_plus_base + sticker_bonus
 
-            planned_grade = grade_from_total(planned_total)
-            current_grade = grade_from_total(prev_total)
+                planned_total = cur_completed_raw + planned_plus
+                prev_total = prev_completed_raw + prev_plus
 
-            nxt, remain = next_grade_target(cur_completed_raw)
+                planned_grade = grade_from_total(planned_total)
+                current_grade = grade_from_total(prev_total)
 
-            ov = join_overrides.get(it["login_key"])
-            join_default_val = ov if ov else it["eff_join"].isoformat()
+                nxt, remain = next_grade_target(cur_completed_raw)
 
-            login_badge = "가상뒷4" if it["login_src"] == "override" else "실제뒷4"
-            login_badge_color = "#111" if it["login_src"] == "override" else "#888"
+                ov = join_overrides.get(it["login_key"])
+                join_default_val = ov if ov else it["eff_join"].isoformat()
 
-            join_badge = "관리자설정" if it["join_src"] == "override" else "배민입사"
-            join_badge_color = "#111" if it["join_src"] == "override" else "#888"
+                login_badge = "가상뒷4" if it["login_src"] == "override" else "실제뒷4"
+                login_badge_color = "#111" if it["login_src"] == "override" else "#888"
 
-            today_info = today_stats_map.get(it["real_key"]) or {
-                "complete": 0,
-                "reject": 0,
-                "cancel": 0,
-                "status_desc": "-",
-                **calc_bad_ratio(0, 0, 0),
-            }
+                join_badge = "관리자설정" if it["join_src"] == "override" else "배민입사"
+                join_badge_color = "#111" if it["join_src"] == "override" else "#888"
 
-            rider_phone = normalize_phone(rr.get("phoneNumber", "") or "")
-            roulette_status = roulette_db.get_status(rider_phone, nm, int(today_info["complete"]))
+                today_info = today_stats_map.get(it["real_key"]) or {
+                    "complete": 0,
+                    "reject": 0,
+                    "cancel": 0,
+                    "status_desc": "-",
+                    **calc_bad_ratio(0, 0, 0),
+                }
 
-            final_rows.append({
-                "name": nm,
-                "created": created_d,
-                "real4": it["real4"],
-                "login4": it["login4"],
-                "login_badge": login_badge,
-                "login_badge_color": login_badge_color,
-                "join_effective": it["eff_join"].isoformat(),
-                "join_badge": join_badge,
-                "join_badge_color": join_badge_color,
-                "join_default_val": join_default_val,
-                "policy_from": it["cur_start"].isoformat(),
-                "policy_to": it["cur_end_incl"].isoformat(),
-                "api_from": it["cur_from"].isoformat(),
-                "api_to": it["cur_to"].isoformat(),
-                "cur_completed_raw": cur_completed_raw,
-                "prev_completed_raw": prev_completed_raw,
-                "prev_plus": prev_plus,
-                "planned_plus": planned_plus,
-                "current_grade": current_grade,
-                "planned_grade": planned_grade,
-                "next": nxt or "-",
-                "remain": remain if remain is not None else "-",
-                "login_key": it["login_key"],
-                "name_norm": it["nn"],
+                rider_phone = normalize_phone(rr.get("phoneNumber", "") or "")
+                roulette_status = roulette_db.get_status(rider_phone, nm, int(today_info["complete"]))
 
-                "today_complete": int(today_info["complete"]),
-                "today_reject": int(today_info["reject"]),
-                "today_cancel": int(today_info["cancel"]),
-                "today_total": int(today_info["total"]),
-                "today_ratio": float(today_info["ratio"]),
-                "today_ratio_fg": str(today_info["fg"]),
-                "today_ratio_bg": str(today_info["bg"]),
-                "today_ratio_label": str(today_info["label"]),
-                "today_status_desc": str(today_info["status_desc"]),
-
-                "roulette_remain": int(roulette_status.get("remain_count") or 0),
-                "roulette_weekly_total": int(roulette_status.get("weekly_total") or 0),
-                "planned_plus_base": planned_plus_base,
-                "sticker_bonus": sticker_bonus,
-                "sticker_attached": is_sticker_attached(it["login_key"]),
-            })
+                final_rows.append({
+                    "name": nm,
+                    "created": created_d,
+                    "real4": it["real4"],
+                    "login4": it["login4"],
+                    "login_badge": login_badge,
+                    "login_badge_color": login_badge_color,
+                    "join_effective": it["eff_join"].isoformat(),
+                    "join_badge": join_badge,
+                    "join_badge_color": join_badge_color,
+                    "join_default_val": join_default_val,
+                    "policy_from": it["cur_start"].isoformat(),
+                    "policy_to": it["cur_end_incl"].isoformat(),
+                    "api_from": it["cur_from"].isoformat(),
+                    "api_to": it["cur_to"].isoformat(),
+                    "cur_completed_raw": cur_completed_raw,
+                    "prev_completed_raw": prev_completed_raw,
+                    "prev_plus": prev_plus,
+                    "planned_plus": planned_plus,
+                    "current_grade": current_grade,
+                    "planned_grade": planned_grade,
+                    "next": nxt or "-",
+                    "remain": remain if remain is not None else "-",
+                    "login_key": it["login_key"],
+                    "name_norm": it["nn"],
+                    "today_complete": int(today_info["complete"]),
+                    "today_reject": int(today_info["reject"]),
+                    "today_cancel": int(today_info["cancel"]),
+                    "today_total": int(today_info["total"]),
+                    "today_ratio": float(today_info["ratio"]),
+                    "today_ratio_fg": str(today_info["fg"]),
+                    "today_ratio_bg": str(today_info["bg"]),
+                    "today_ratio_label": str(today_info["label"]),
+                    "today_status_desc": str(today_info["status_desc"]),
+                    "roulette_remain": int(roulette_status.get("remain_count") or 0),
+                    "roulette_weekly_total": int(roulette_status.get("weekly_total") or 0),
+                    "planned_plus_base": planned_plus_base,
+                    "sticker_bonus": sticker_bonus,
+                    "sticker_attached": is_sticker_attached(it["login_key"]),
+                })
 
     final_rows.sort(key=lambda x: (x["cur_completed_raw"], -x["today_ratio"]), reverse=True)
 
