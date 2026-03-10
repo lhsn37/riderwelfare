@@ -1593,7 +1593,7 @@ def check(
             height:0;
             border-left:18px solid transparent;
             border-right:18px solid transparent;
-            border-bottom:34px solid #ef4444;
+            border-top:34px solid #ef4444;
             z-index:4;
             filter:drop-shadow(0 3px 3px rgba(0,0,0,0.16));
           "></div>
