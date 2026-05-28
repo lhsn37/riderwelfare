@@ -4194,3 +4194,311 @@ def admin_backup_export_force_real_zip(request: Request):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+
+# ============================================================
+# FINAL BACKUP ROUTE OVERRIDE
+# 기존 중복 /backup/export, /backup/import 라우트를 모두 제거하고
+# 실제 ZIP 백업/복원 라우트만 다시 등록합니다.
+# ============================================================
+
+def _final_make_backup_zip_bytes():
+    import json
+    import zipfile
+    from io import BytesIO
+    from pathlib import Path
+    from datetime import datetime
+
+    mem = BytesIO()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    roots = []
+    try:
+        roots.append(Path(STORE_DIR))
+    except Exception:
+        pass
+    roots.append(Path("."))
+
+    include_names = {
+        "store_riders.json",
+        "store_status.json",
+        "store_delivery_status.json",
+        "join_overrides.json",
+        "login4_overrides.json",
+        "prevplus_overrides.json",
+        "plannedplus_overrides.json",
+        "attendance_log.json",
+        "sticker_overrides.json",
+        "admin_settings.json",
+        "roulette.json",
+        "roulette_spins.json",
+        "roulette_config.json",
+        "roulette_settings.json",
+        "roulette.db",
+        "app.db",
+        "grade.db",
+    }
+
+    added = set()
+
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("backup_info.json", json.dumps({
+            "ok": True,
+            "created_at": ts,
+            "type": "riderwelfare_final_full_zip_backup",
+            "store_dir": str(STORE_DIR),
+        }, ensure_ascii=False, indent=2))
+
+        for root in roots:
+            if not root.exists():
+                continue
+
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+
+                name = path.name
+                rel = str(path.relative_to(root)).replace("\\", "/")
+                lower_rel = rel.lower()
+
+                should_add = False
+                if name in include_names:
+                    should_add = True
+                if name.endswith(".json"):
+                    should_add = True
+                if "roulette" in lower_rel:
+                    should_add = True
+
+                if not should_add:
+                    continue
+
+                key = str(path.resolve())
+                if key in added:
+                    continue
+
+                arcname = f"{root.name}/{rel}" if root.name else rel
+
+                try:
+                    z.write(path, arcname)
+                    added.add(key)
+                except Exception:
+                    pass
+
+        try:
+            rj = roulette_db.export_json()
+            z.writestr("roulette_export.json", json.dumps(rj, ensure_ascii=False, indent=2))
+        except Exception as e:
+            z.writestr("roulette_export_error.txt", str(e))
+
+        try:
+            payload = get_backup_payload()
+            z.writestr("full_backup_payload.json", json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as e:
+            z.writestr("full_backup_payload_error.txt", str(e))
+
+    mem.seek(0)
+    return mem.getvalue()
+
+
+def _final_restore_backup_bytes(data: bytes):
+    import json
+    import zipfile
+    from io import BytesIO
+    from pathlib import Path
+
+    try:
+        payload = json.loads(data.decode("utf-8-sig"))
+        if isinstance(payload, dict):
+            try:
+                result = restore_backup_payload(payload)
+                result["type"] = "json"
+                return result
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    zf = zipfile.ZipFile(BytesIO(data), "r")
+    target_root = Path(STORE_DIR)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    restored = 0
+    skipped = 0
+    roulette_result = None
+    roulette_payload = None
+    roulette_spins = None
+
+    allowed_ext = {".json", ".db", ".sqlite", ".sqlite3"}
+
+    with zf as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+
+            raw_name = info.filename.replace("\\", "/")
+            file_name = Path(raw_name).name
+            suffix = Path(file_name).suffix.lower()
+            raw = z.read(info.filename)
+
+            if file_name == "backup_info.json":
+                skipped += 1
+                continue
+
+            if file_name == "full_backup_payload.json":
+                try:
+                    payload = json.loads(raw.decode("utf-8-sig"))
+                    if isinstance(payload, dict):
+                        result = restore_backup_payload(payload)
+                        result["type"] = "zip_payload"
+                        return result
+                except Exception:
+                    pass
+
+            if file_name in {"roulette_export.json", "roulette_spins.json", "roulette_history_all.json", "roulette_history.json"}:
+                try:
+                    loaded = json.loads(raw.decode("utf-8-sig"))
+                    if isinstance(loaded, dict):
+                        if "spins" in loaded or "settings" in loaded or "segments" in loaded:
+                            roulette_payload = loaded
+                        elif isinstance(loaded.get("roulette"), dict):
+                            roulette_payload = loaded.get("roulette")
+                    elif isinstance(loaded, list):
+                        roulette_spins = loaded
+                except Exception:
+                    pass
+
+            if suffix not in allowed_ext:
+                skipped += 1
+                continue
+
+            try:
+                out_path = target_root / file_name
+                out_path.write_bytes(raw)
+                restored += 1
+            except Exception:
+                skipped += 1
+
+    try:
+        if isinstance(roulette_payload, dict):
+            roulette_result = roulette_db.import_json(roulette_payload)
+        elif isinstance(roulette_spins, list):
+            try:
+                current = roulette_db.export_json()
+            except Exception:
+                current = {}
+            if not isinstance(current, dict):
+                current = {}
+            current["spins"] = roulette_spins
+            roulette_result = roulette_db.import_json(current)
+    except Exception as e:
+        roulette_result = {"ok": False, "error": str(e)}
+
+    try:
+        _riders_cache["ts"] = 0.0
+        _riders_cache["data"] = None
+    except Exception:
+        pass
+    try:
+        _status_cache.clear()
+    except Exception:
+        pass
+    try:
+        _delivery_status_cache["ts"] = 0.0
+        _delivery_status_cache["data"] = None
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "type": "zip",
+        "restored": restored,
+        "skipped": skipped,
+        "roulette_result": roulette_result,
+    }
+
+
+def _final_backup_export(request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    from datetime import datetime
+
+    data = _final_make_backup_zip_bytes()
+    filename = "backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    return Response(
+        data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+def _final_admin_backup_export(request):
+    r = require_admin(request)
+    if r:
+        return r
+
+    from datetime import datetime
+
+    data = _final_make_backup_zip_bytes()
+    filename = "admin_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    return Response(
+        data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+async def _final_backup_import(request, file: UploadFile = File(...)):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    data = await file.read()
+    try:
+        return _final_restore_backup_bytes(data)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+async def _final_admin_backup_import(request, file: UploadFile = File(...)):
+    r = require_admin(request)
+    if r:
+        return r
+
+    data = await file.read()
+    try:
+        result = _final_restore_backup_bytes(data)
+        body = (
+            "<div style='background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:820px;margin:0 auto;'>"
+            "<h3 style='margin-top:0;'>전체 백업 복원 완료</h3>"
+            "<div style='color:#666;line-height:1.7;'>"
+            "결과: <b>" + str(result) + "</b>"
+            "</div>"
+            "<div style='margin-top:12px;'>"
+            "<a href='/admin/roulette' style='text-decoration:none;color:#111;'>룰렛 관리자 확인</a>"
+            "&nbsp; | &nbsp;"
+            "<a href='/dashboard' style='text-decoration:none;color:#111;'>대시보드 확인</a>"
+            "&nbsp; | &nbsp;"
+            "<a href='/health' style='text-decoration:none;color:#111;'>Health 확인</a>"
+            "</div></div>"
+        )
+        return HTMLResponse(html_page("전체 백업 복원 완료", body))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+try:
+    _backup_paths = {"/backup/export", "/admin/backup/export", "/backup/import", "/admin/backup/import"}
+    app.router.routes = [
+        route for route in app.router.routes
+        if not (getattr(route, "path", None) in _backup_paths)
+    ]
+
+    app.add_api_route("/backup/export", _final_backup_export, methods=["GET"], name="Final Backup Export")
+    app.add_api_route("/admin/backup/export", _final_admin_backup_export, methods=["GET"], name="Final Admin Backup Export")
+    app.add_api_route("/backup/import", _final_backup_import, methods=["POST"], name="Final Backup Import")
+    app.add_api_route("/admin/backup/import", _final_admin_backup_import, methods=["POST"], name="Final Admin Backup Import")
+except Exception as _e:
+    print("FINAL BACKUP ROUTE OVERRIDE ERROR:", _e)
