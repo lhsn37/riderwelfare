@@ -4418,7 +4418,7 @@ def _final_restore_backup_bytes(data: bytes):
     }
 
 
-def _final_backup_export(request):
+def _final_backup_export(request: Request):
     auth = _require_ingest(request)
     if auth:
         return auth
@@ -4434,7 +4434,7 @@ def _final_backup_export(request):
     )
 
 
-def _final_admin_backup_export(request):
+def _final_admin_backup_export(request: Request):
     r = require_admin(request)
     if r:
         return r
@@ -4450,7 +4450,7 @@ def _final_admin_backup_export(request):
     )
 
 
-async def _final_backup_import(request, file: UploadFile = File(...)):
+async def _final_backup_import(request: Request, file: UploadFile = File(...)):
     auth = _require_ingest(request)
     if auth:
         return auth
@@ -4462,7 +4462,7 @@ async def _final_backup_import(request, file: UploadFile = File(...)):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
-async def _final_admin_backup_import(request, file: UploadFile = File(...)):
+async def _final_admin_backup_import(request: Request, file: UploadFile = File(...)):
     r = require_admin(request)
     if r:
         return r
