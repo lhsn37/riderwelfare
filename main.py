@@ -3655,7 +3655,9 @@ def admin_roulette_history_csv(
 # -----------------------------
 # Full backup export/import
 # -----------------------------
-@app.get("/backup/export")
+# DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# # DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# @app.get("/backup/export")
 def backup_export(request: Request):
     # 로컬 PC 자동백업용: x-ingest-token 필요
     auth = _require_ingest(request)
@@ -3677,7 +3679,9 @@ async def backup_import(request: Request, file: UploadFile = File(...)):
     return restore_backup_payload(payload)
 
 
-@app.get("/admin/backup/export")
+# DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# # DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# @app.get("/admin/backup/export")
 def admin_backup_export(request: Request):
     r = require_admin(request)
     if r:
@@ -4055,3 +4059,138 @@ async def admin_backup_import_any(request: Request, file: UploadFile = File(...)
         return HTMLResponse(html_page("전체 백업 복원 완료", body))
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+
+# ============================================================
+# FORCE REAL ZIP BACKUP EXPORT
+# /backup/export 가 JSON이 아니라 진짜 ZIP을 반환하게 강제
+# ============================================================
+
+def _make_force_full_backup_zip():
+    import json
+    import zipfile
+    from io import BytesIO
+    from pathlib import Path
+    from datetime import datetime
+
+    mem = BytesIO()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    roots = []
+    try:
+        roots.append(Path(STORE_DIR))
+    except Exception:
+        pass
+    roots.append(Path("."))
+
+    include_names = {
+        "store_riders.json",
+        "store_status.json",
+        "store_delivery_status.json",
+        "join_overrides.json",
+        "login4_overrides.json",
+        "prevplus_overrides.json",
+        "plannedplus_overrides.json",
+        "attendance_log.json",
+        "sticker_overrides.json",
+        "roulette.json",
+        "roulette_spins.json",
+        "roulette_config.json",
+        "roulette_settings.json",
+        "roulette.db",
+        "app.db",
+        "grade.db",
+    }
+
+    added = set()
+
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("backup_info.json", json.dumps({
+            "ok": True,
+            "created_at": ts,
+            "type": "riderwelfare_full_zip_backup",
+            "store_dir": str(STORE_DIR),
+        }, ensure_ascii=False, indent=2))
+
+        for root in roots:
+            if not root.exists():
+                continue
+
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+
+                name = path.name
+                rel = str(path.relative_to(root)).replace("\\", "/")
+                lower_rel = rel.lower()
+
+                should_add = False
+                if name in include_names:
+                    should_add = True
+                if name.endswith(".json"):
+                    should_add = True
+                if "roulette" in lower_rel:
+                    should_add = True
+
+                if not should_add:
+                    continue
+
+                key = str(path.resolve())
+                if key in added:
+                    continue
+
+                arcname = f"{root.name}/{rel}" if root.name else rel
+
+                try:
+                    z.write(path, arcname)
+                    added.add(key)
+                except Exception:
+                    pass
+
+        try:
+            rj = roulette_db.export_json()
+            z.writestr("roulette_export.json", json.dumps(rj, ensure_ascii=False, indent=2))
+        except Exception as e:
+            z.writestr("roulette_export_error.txt", str(e))
+
+    mem.seek(0)
+    return mem.getvalue()
+
+
+# DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# @app.get("/backup/export")
+def backup_export_force_real_zip(request: Request):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    from datetime import datetime
+
+    data = _make_force_full_backup_zip()
+    filename = "backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+
+    return Response(
+        data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+# DISABLED_BY_FORCE_REAL_ZIP_EXPORT
+# @app.get("/admin/backup/export")
+def admin_backup_export_force_real_zip(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+
+    from datetime import datetime
+
+    data = _make_force_full_backup_zip()
+    filename = "admin_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+
+    return Response(
+        data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
