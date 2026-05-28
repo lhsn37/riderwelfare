@@ -1,3 +1,4 @@
+KST = timezone(timedelta(hours=9))
 # main.py
 # ------------------------------------------------------------------------------------
 # Render 조회용: PC Collector가 업로드한 데이터만 사용
@@ -23,7 +24,7 @@ import re
 import threading
 import time
 import zipfile
-from datetime import date, timedelta
+from datetime import timezone, timedelta,  date, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -4072,10 +4073,10 @@ def _make_force_full_backup_zip():
     import zipfile
     from io import BytesIO
     from pathlib import Path
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     mem = BytesIO()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
 
     roots = []
     try:
@@ -4165,10 +4166,10 @@ def backup_export_force_real_zip(request: Request):
     if auth:
         return auth
 
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     data = _make_force_full_backup_zip()
-    filename = "backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    filename = "backup_" + datetime.now(KST).strftime("%Y%m%d_%H%M%S") + ".zip"
 
     return Response(
         data,
@@ -4184,10 +4185,10 @@ def admin_backup_export_force_real_zip(request: Request):
     if r:
         return r
 
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     data = _make_force_full_backup_zip()
-    filename = "admin_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    filename = "admin_backup_" + datetime.now(KST).strftime("%Y%m%d_%H%M%S") + ".zip"
 
     return Response(
         data,
@@ -4208,10 +4209,10 @@ def _final_make_backup_zip_bytes():
     import zipfile
     from io import BytesIO
     from pathlib import Path
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     mem = BytesIO()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
 
     roots = []
     try:
@@ -4423,10 +4424,10 @@ def _final_backup_export(request: Request):
     if auth:
         return auth
 
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     data = _final_make_backup_zip_bytes()
-    filename = "backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    filename = "backup_" + datetime.now(KST).strftime("%Y%m%d_%H%M%S") + ".zip"
     return Response(
         data,
         media_type="application/zip",
@@ -4439,10 +4440,10 @@ def _final_admin_backup_export(request: Request):
     if r:
         return r
 
-    from datetime import datetime
+    from datetime import timezone, timedelta,  datetime
 
     data = _final_make_backup_zip_bytes()
-    filename = "admin_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
+    filename = "admin_backup_" + datetime.now(KST).strftime("%Y%m%d_%H%M%S") + ".zip"
     return Response(
         data,
         media_type="application/zip",
