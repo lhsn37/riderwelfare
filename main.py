@@ -3665,6 +3665,7 @@ def backup_export(request: Request):
 
 
 # DISABLED_BY_ZIP_IMPORT_FIX
+# # DISABLED_BY_ROULETTE_ZIP_IMPORT_FIX
 # @app.post("/backup/import")
 async def backup_import(request: Request, file: UploadFile = File(...)):
     # 로컬/긴급 복원용: x-ingest-token 필요
@@ -3691,6 +3692,7 @@ def admin_backup_export(request: Request):
 
 
 # DISABLED_BY_ZIP_IMPORT_FIX
+# # DISABLED_BY_ROULETTE_ZIP_IMPORT_FIX
 # @app.post("/admin/backup/import")
 async def admin_backup_import(request: Request, file: UploadFile = File(...)):
     r = require_admin(request)
@@ -3817,7 +3819,8 @@ def _restore_zip_backup_bytes(data: bytes):
     return {"ok": True, "restored": restored, "skipped": skipped, "type": "zip"}
 
 
-@app.post("/backup/import")
+# DISABLED_BY_ROULETTE_ZIP_IMPORT_FIX
+# @app.post("/backup/import")
 async def backup_import_zip(request: Request, file: UploadFile = File(...)):
     auth = _require_ingest(request)
     if auth:
@@ -3838,7 +3841,8 @@ async def backup_import_zip(request: Request, file: UploadFile = File(...)):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
-@app.post("/admin/backup/import")
+# DISABLED_BY_ROULETTE_ZIP_IMPORT_FIX
+# @app.post("/admin/backup/import")
 async def admin_backup_import_zip(request: Request, file: UploadFile = File(...)):
     admin_redirect = require_admin(request)
     if admin_redirect:
@@ -3871,5 +3875,183 @@ async def admin_backup_import_zip(request: Request, file: UploadFile = File(...)
         </div>
         """
         return HTMLResponse(html_page("백업 복원 완료", body))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+
+# ============================================================
+# ROULETTE ZIP IMPORT FIX
+# - ZIP 복원 시 룰렛 당첨내역까지 roulette_db에 직접 import
+# - 자동백업 파일이 .zip 확장자지만 실제 JSON이어도 복원 가능
+# ============================================================
+
+def _restore_full_backup_any_bytes(data: bytes, filename: str = ""):
+    import json
+    import zipfile
+    from io import BytesIO
+    from pathlib import Path
+
+    restored = 0
+    skipped = 0
+    roulette_result = None
+
+    try:
+        as_text = data.decode("utf-8")
+        payload = json.loads(as_text)
+        if isinstance(payload, dict) and ("files" in payload or "roulette" in payload):
+            try:
+                result = restore_backup_payload(payload)
+                result["type"] = "json_payload"
+                return result
+            except NameError:
+                pass
+    except Exception:
+        pass
+
+    try:
+        zf = zipfile.ZipFile(BytesIO(data), "r")
+    except Exception as e:
+        raise ValueError(f"ZIP 또는 JSON 백업 파일이 아닙니다: {e}")
+
+    allowed_ext = {".json", ".db", ".sqlite", ".sqlite3"}
+    target_root = Path(STORE_DIR)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    roulette_spins = None
+    roulette_payload = None
+
+    with zf as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+
+            raw_name = info.filename.replace("\\", "/")
+            file_name = Path(raw_name).name
+            suffix = Path(file_name).suffix.lower()
+            raw = z.read(info.filename)
+
+            if file_name == "backup_info.json":
+                skipped += 1
+                continue
+
+            if file_name in {
+                "roulette_spins.json",
+                "roulette_history_all.json",
+                "source_roulette_history.json",
+                "roulette_history.json",
+            }:
+                try:
+                    loaded = json.loads(raw.decode("utf-8-sig"))
+                    if isinstance(loaded, list):
+                        roulette_spins = loaded
+                    elif isinstance(loaded, dict) and isinstance(loaded.get("spins"), list):
+                        roulette_spins = loaded.get("spins")
+                    elif isinstance(loaded, dict) and isinstance(loaded.get("roulette"), dict):
+                        roulette_payload = loaded.get("roulette")
+                except Exception:
+                    pass
+
+            if suffix == ".json":
+                try:
+                    loaded = json.loads(raw.decode("utf-8-sig"))
+                    if isinstance(loaded, dict) and isinstance(loaded.get("roulette"), dict):
+                        roulette_payload = loaded.get("roulette")
+                except Exception:
+                    pass
+
+            if suffix not in allowed_ext:
+                skipped += 1
+                continue
+
+            try:
+                out_path = target_root / file_name
+                out_path.write_bytes(raw)
+                restored += 1
+            except Exception:
+                skipped += 1
+
+    try:
+        if roulette_payload is not None and isinstance(roulette_payload, dict):
+            roulette_result = roulette_db.import_json(roulette_payload)
+        elif roulette_spins is not None and isinstance(roulette_spins, list):
+            try:
+                current = roulette_db.export_json()
+            except Exception:
+                current = {}
+            if not isinstance(current, dict):
+                current = {}
+            current["spins"] = roulette_spins
+            roulette_result = roulette_db.import_json(current)
+    except Exception as e:
+        roulette_result = {"ok": False, "error": str(e)}
+
+    try:
+        _riders_cache["ts"] = 0.0
+        _riders_cache["data"] = None
+    except Exception:
+        pass
+
+    try:
+        _status_cache.clear()
+    except Exception:
+        pass
+
+    try:
+        _delivery_status_cache["ts"] = 0.0
+        _delivery_status_cache["data"] = None
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "type": "zip",
+        "restored": restored,
+        "skipped": skipped,
+        "roulette_result": roulette_result,
+    }
+
+
+@app.post("/backup/import")
+async def backup_import_any(request: Request, file: UploadFile = File(...)):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    data = await file.read()
+    try:
+        return _restore_full_backup_any_bytes(data, file.filename or "")
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.post("/admin/backup/import")
+async def admin_backup_import_any(request: Request, file: UploadFile = File(...)):
+    r = require_admin(request)
+    if r:
+        return r
+
+    data = await file.read()
+
+    try:
+        result = _restore_full_backup_any_bytes(data, file.filename or "")
+        rr = result.get("roulette_result")
+        body = (
+            "<div style='background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:820px;margin:0 auto;'>"
+            "<h3 style='margin-top:0;'>전체 백업 복원 완료</h3>"
+            "<div style='color:#666;line-height:1.7;'>"
+            "복원 파일 수: <b>" + str(result.get("restored", "-")) + "</b><br/>"
+            "제외 파일 수: <b>" + str(result.get("skipped", "-")) + "</b><br/>"
+            "룰렛 복원 결과: <b>" + str(rr) + "</b>"
+            "</div>"
+            "<div style='margin-top:12px;'>"
+            "<a href='/admin/roulette' style='text-decoration:none;color:#111;'>룰렛 관리자 확인</a>"
+            "&nbsp; | &nbsp;"
+            "<a href='/dashboard' style='text-decoration:none;color:#111;'>대시보드 확인</a>"
+            "&nbsp; | &nbsp;"
+            "<a href='/health' style='text-decoration:none;color:#111;'>Health 확인</a>"
+            "</div></div>"
+        )
+        return HTMLResponse(html_page("전체 백업 복원 완료", body))
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
