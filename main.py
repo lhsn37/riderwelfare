@@ -3664,7 +3664,8 @@ def backup_export(request: Request):
     return get_backup_payload()
 
 
-@app.post("/backup/import")
+# DISABLED_BY_ZIP_IMPORT_FIX
+# @app.post("/backup/import")
 async def backup_import(request: Request, file: UploadFile = File(...)):
     # 로컬/긴급 복원용: x-ingest-token 필요
     auth = _require_ingest(request)
@@ -3689,7 +3690,8 @@ def admin_backup_export(request: Request):
     )
 
 
-@app.post("/admin/backup/import")
+# DISABLED_BY_ZIP_IMPORT_FIX
+# @app.post("/admin/backup/import")
 async def admin_backup_import(request: Request, file: UploadFile = File(...)):
     r = require_admin(request)
     if r:
@@ -3754,3 +3756,120 @@ def version():
         "ts": int(time.time()),
         "render_git": os.getenv("RENDER_GIT_COMMIT", ""),
     }
+
+
+
+# ============================================================
+# ZIP FULL BACKUP IMPORT FIX
+# ZIP 파일 그대로 업로드 복원 가능
+# ============================================================
+
+def _restore_zip_backup_bytes(data: bytes):
+    import zipfile
+    from io import BytesIO
+    from pathlib import Path
+
+    restored = 0
+    skipped = 0
+    allowed_ext = {".json", ".db", ".sqlite", ".sqlite3"}
+
+    target_root = Path(STORE_DIR)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(BytesIO(data), "r") as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+
+            raw_name = info.filename.replace("\\", "/")
+            filename = Path(raw_name).name
+
+            if filename == "backup_info.json":
+                skipped += 1
+                continue
+
+            suffix = Path(filename).suffix.lower()
+            if suffix not in allowed_ext:
+                skipped += 1
+                continue
+
+            out_path = target_root / filename
+            out_path.write_bytes(z.read(info.filename))
+            restored += 1
+
+    try:
+        _riders_cache["ts"] = 0.0
+        _riders_cache["data"] = None
+    except Exception:
+        pass
+
+    try:
+        _status_cache.clear()
+    except Exception:
+        pass
+
+    try:
+        _delivery_status_cache["ts"] = 0.0
+        _delivery_status_cache["data"] = None
+    except Exception:
+        pass
+
+    return {"ok": True, "restored": restored, "skipped": skipped, "type": "zip"}
+
+
+@app.post("/backup/import")
+async def backup_import_zip(request: Request, file: UploadFile = File(...)):
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+
+    filename = (file.filename or "").lower()
+    data = await file.read()
+
+    if not filename.endswith(".zip"):
+        return JSONResponse(
+            {"ok": False, "error": "ZIP 파일만 업로드 가능합니다."},
+            status_code=400
+        )
+
+    try:
+        return _restore_zip_backup_bytes(data)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.post("/admin/backup/import")
+async def admin_backup_import_zip(request: Request, file: UploadFile = File(...)):
+    admin_redirect = require_admin(request)
+    if admin_redirect:
+        return admin_redirect
+
+    filename = (file.filename or "").lower()
+    data = await file.read()
+
+    if not filename.endswith(".zip"):
+        return JSONResponse(
+            {"ok": False, "error": "ZIP 파일만 업로드 가능합니다."},
+            status_code=400
+        )
+
+    try:
+        result = _restore_zip_backup_bytes(data)
+        body = f"""
+        <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:720px;margin:0 auto;">
+          <h3 style="margin-top:0;">백업 복원 완료</h3>
+          <div style="line-height:1.7;color:#333;">
+            복원 파일 수: <b>{result.get('restored')}</b><br/>
+            제외 파일 수: <b>{result.get('skipped')}</b><br/>
+            형식: <b>ZIP</b>
+          </div>
+          <div style="margin-top:14px;">
+            <a href="/health" style="color:#111;text-decoration:none;">Health 확인</a>
+            &nbsp; | &nbsp;
+            <a href="/dashboard" style="color:#111;text-decoration:none;">대시보드 확인</a>
+          </div>
+        </div>
+        """
+        return HTMLResponse(html_page("백업 복원 완료", body))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
