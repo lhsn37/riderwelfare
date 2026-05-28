@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+import zipfile
 from datetime import date, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -62,12 +63,14 @@ PREVPLUS_FILE = "prevplus_overrides.json"        # key: "normname|login4" -> int
 PLANNEDPLUS_FILE = "plannedplus_overrides.json"  # key: "normname|login4" -> int
 ATTENDANCE_FILE = "attendance_log.json"          # key: login_key -> {period_start, period_end, days:[YYYY-MM-DD...]}
 STICKER_FILE = "sticker_overrides.json"          # key: login_key -> bool
+ADMIN_SETTINGS_FILE = "admin_settings.json"        # 관리자 비밀번호 등 복원 가능한 설정
 
 ATTENDANCE_BONUS_PER_DAY = 5
 ATTENDANCE_MIN_TODAY_COMPLETE = 6
 
-PCX_START_DATE = date(2025, 11, 26)
-PCX_LABEL = "25.11.26 ~ (어제)"
+NMAX_START_DATE = date(2026, 5, 28)
+NMAX_LABEL = "26.05.28 ~ (어제)"
+EVENT_NAME = "NMAX"
 
 _override_lock = threading.Lock()
 _login4_lock = threading.Lock()
@@ -81,6 +84,29 @@ _rate_bucket: Dict[str, List[float]] = {}
 # 저장 위치
 STORE_DIR = Path(os.getenv("STORE_DIR", "."))
 STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Render Disk를 쓰는 경우, 모든 운영 데이터 파일을 STORE_DIR에 저장합니다.
+# 기존 루트 경로에 남아있던 파일은 최초 실행 시 STORE_DIR로 1회 복사합니다.
+_STATE_FILES = [
+    OVERRIDE_FILE, LOGIN4_FILE, PREVPLUS_FILE, PLANNEDPLUS_FILE,
+    ATTENDANCE_FILE, STICKER_FILE, ADMIN_SETTINGS_FILE,
+]
+for _fn in _STATE_FILES:
+    try:
+        _src = Path(_fn)
+        _dst = STORE_DIR / _fn
+        if _src.exists() and not _dst.exists():
+            _dst.write_bytes(_src.read_bytes())
+    except Exception:
+        pass
+
+OVERRIDE_FILE = str(STORE_DIR / OVERRIDE_FILE)
+LOGIN4_FILE = str(STORE_DIR / LOGIN4_FILE)
+PREVPLUS_FILE = str(STORE_DIR / PREVPLUS_FILE)
+PLANNEDPLUS_FILE = str(STORE_DIR / PLANNEDPLUS_FILE)
+ATTENDANCE_FILE = str(STORE_DIR / ATTENDANCE_FILE)
+STICKER_FILE = str(STORE_DIR / STICKER_FILE)
+ADMIN_SETTINGS_FILE = str(STORE_DIR / ADMIN_SETTINGS_FILE)
 RIDERS_STORE = STORE_DIR / "store_riders.json"
 STATUS_STORE = STORE_DIR / "store_status.json"
 DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"
@@ -805,6 +831,142 @@ def get_rider_roulette_status_by_name_login4(name: str, login4: str) -> Dict[str
 
 
 # -----------------------------
+# Admin settings
+# -----------------------------
+def load_admin_settings() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(ADMIN_SETTINGS_FILE):
+            return {}
+        with open(ADMIN_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_admin_settings(data: Dict[str, Any]) -> None:
+    with open(ADMIN_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_admin_password() -> str:
+    # 백업 복원된 비밀번호가 있으면 우선 적용, 없으면 Render 환경변수 ADMIN_PASSWORD 사용
+    settings = load_admin_settings()
+    pw = str(settings.get("ADMIN_PASSWORD") or "").strip()
+    return pw or ADMIN_PASSWORD
+
+
+def get_backup_payload() -> Dict[str, Any]:
+    files = {}
+    paths = [
+        RIDERS_STORE, STATUS_STORE, DELIVERY_STATUS_STORE,
+        Path(OVERRIDE_FILE), Path(LOGIN4_FILE), Path(PREVPLUS_FILE),
+        Path(PLANNEDPLUS_FILE), Path(ATTENDANCE_FILE), Path(STICKER_FILE),
+        Path(ADMIN_SETTINGS_FILE),
+    ]
+
+    for path in paths:
+        try:
+            if path.exists():
+                files[path.name] = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                files[path.name] = None
+        except Exception as e:
+            files[path.name] = {"_backup_error": str(e)}
+
+    try:
+        roulette_payload = roulette_db.export_json()
+    except Exception as e:
+        roulette_payload = {"_backup_error": str(e)}
+
+    return {
+        "ok": True,
+        "service": "riderwelfare-render-backup",
+        "backup_format": 2,
+        "created_at": int(time.time()),
+        "event_name": EVENT_NAME,
+        "event_start_date": NMAX_START_DATE.isoformat(),
+        "event_label": NMAX_LABEL,
+        "store_dir": str(STORE_DIR),
+        "admin": {
+            # Render 환경변수 자체를 바꾸는 것은 아니고, 복원용 admin_settings.json에 저장됩니다.
+            "ADMIN_PASSWORD": get_admin_password(),
+        },
+        "files": files,
+        "roulette": roulette_payload,
+    }
+
+
+def restore_backup_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("백업 JSON 형식이 올바르지 않습니다.")
+
+    # 안전장치: 현재 Render 데이터를 먼저 백업 파일로 남김
+    backup_before = get_backup_payload()
+    backup_dir = STORE_DIR / "restore_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_name = f"before_restore_{int(time.time())}.json"
+    (backup_dir / backup_name).write_text(json.dumps(backup_before, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    restored_files = []
+    file_map = {
+        "store_riders.json": RIDERS_STORE,
+        "store_status.json": STATUS_STORE,
+        "store_delivery_status.json": DELIVERY_STATUS_STORE,
+        Path(OVERRIDE_FILE).name: Path(OVERRIDE_FILE),
+        Path(LOGIN4_FILE).name: Path(LOGIN4_FILE),
+        Path(PREVPLUS_FILE).name: Path(PREVPLUS_FILE),
+        Path(PLANNEDPLUS_FILE).name: Path(PLANNEDPLUS_FILE),
+        Path(ATTENDANCE_FILE).name: Path(ATTENDANCE_FILE),
+        Path(STICKER_FILE).name: Path(STICKER_FILE),
+        Path(ADMIN_SETTINGS_FILE).name: Path(ADMIN_SETTINGS_FILE),
+    }
+
+    files = payload.get("files") or {}
+    if isinstance(files, dict):
+        for name, data in files.items():
+            if name not in file_map or data is None:
+                continue
+            # 백업 오류 객체는 복원하지 않음
+            if isinstance(data, dict) and "_backup_error" in data:
+                continue
+            path = file_map[name]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            restored_files.append(name)
+
+    # 예전/새 백업 모두 대응: admin 섹션이 있으면 관리자 비밀번호 복원 파일에 저장
+    admin = payload.get("admin") or {}
+    if isinstance(admin, dict) and str(admin.get("ADMIN_PASSWORD") or "").strip():
+        settings = load_admin_settings()
+        settings["ADMIN_PASSWORD"] = str(admin.get("ADMIN_PASSWORD")).strip()
+        save_admin_settings(settings)
+        if "admin_settings.json" not in restored_files:
+            restored_files.append("admin_settings.json")
+
+    roulette_result = None
+    roulette_payload = payload.get("roulette")
+    if isinstance(roulette_payload, dict) and "_backup_error" not in roulette_payload:
+        try:
+            roulette_result = roulette_db.import_json(roulette_payload)
+        except Exception as e:
+            roulette_result = {"ok": False, "error": str(e)}
+
+    _riders_cache["ts"] = 0.0
+    _riders_cache["data"] = None
+    _status_cache.clear()
+    _delivery_status_cache["ts"] = 0.0
+    _delivery_status_cache["data"] = None
+
+    return {
+        "ok": True,
+        "backup_before_restore": backup_name,
+        "restored_files": restored_files,
+        "roulette_result": roulette_result,
+    }
+
+
+# -----------------------------
 # Admin helpers
 # -----------------------------
 def require_admin(request: Request) -> Optional[RedirectResponse]:
@@ -952,7 +1114,7 @@ def ingest_ranges(request: Request):
         ranges.add((cur_from.isoformat(), cur_to.isoformat()))
         ranges.add((prev_from.isoformat(), prev_to.isoformat()))
 
-    pcx_from = PCX_START_DATE
+    pcx_from = NMAX_START_DATE
     pcx_to = date.today() - timedelta(days=1)
     if pcx_from <= pcx_to:
         ranges.add((pcx_from.isoformat(), pcx_to.isoformat()))
@@ -1058,9 +1220,9 @@ def admin_help():
       </div>
 
       <div style="margin-top:14px; background:#fff8e8; border:1px solid #ffe1a8; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
-        <div><b>PCX 누적 집계</b></div>
-        <div>- 개인조회 화면에 <b>{PCX_LABEL}</b> 누적 완료건수를 보여줍니다.</div>
-        <div>- 단, PC에서 그 기간({PCX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
+        <div><b>NMAX 누적 집계</b></div>
+        <div>- 개인조회 화면에 <b>{NMAX_LABEL}</b> 누적 완료건수를 보여줍니다.</div>
+        <div>- 단, PC에서 그 기간({NMAX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
       </div>
 
       <div style="margin-top:14px; background:#eef6ff; border:1px solid #cfe3ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
@@ -1075,6 +1237,18 @@ def admin_help():
         <div>- 현재 운영주차: <b>{cycle["display_start"]}</b> ~ <b>{cycle["display_end"]}</b></div>
         <div>- 직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b></div>
         <div>- 지급 CSV: <b>/admin/api/roulette/payout.csv</b> (기본은 직전 마감 주차)</div>
+      </div>
+
+      <div style="margin-top:14px; background:#f7fff5; border:1px solid #cfe8c8; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
+        <div><b>전체 백업 / 전체 복원</b></div>
+        <div>- 룰렛 확률, 룰렛 당첨 전체내역, 예정플러스, 이전플러스, 스티커, 입사일, 로그인용 뒷4자리, 관리자 비밀번호까지 포함합니다.</div>
+        <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <a href="/admin/backup/export" style="text-decoration:none; color:#111; font-weight:900; padding:10px 12px; border:1px solid #ddd; border-radius:10px; background:#fff;">전체 백업 다운로드</a>
+          <form method="post" action="/admin/backup/import" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0;">
+            <input type="file" name="file" accept=".json" required />
+            <button type="submit" style="padding:10px 12px; border:none; border-radius:10px; background:#111; color:#fff; font-weight:900; cursor:pointer;">전체 백업 업로드 복원</button>
+          </form>
+        </div>
       </div>
 
       <div style="margin-top:14px;">
@@ -1314,7 +1488,7 @@ def check(
 
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
-    pcx_from = PCX_START_DATE
+    pcx_from = NMAX_START_DATE
     pcx_to = date.today() - timedelta(days=1)
     pcx_text = "데이터 없음(업로드 필요)"
     if pcx_from <= pcx_to and has_status_range(pcx_from, pcx_to):
@@ -1936,11 +2110,11 @@ def check(
 </script>
 
       <div style="margin-top:12px; padding:12px; border:1px solid #eee; border-radius:14px; background:#fff;">
-        <div style="font-weight:900; margin-bottom:6px;">PCX 이벤트 누적 완료건수</div>
-        <div style="color:#666;">기간: <b>{PCX_LABEL}</b></div>
+        <div style="font-weight:900; margin-bottom:6px;">NMAX 이벤트 누적 완료건수</div>
+        <div style="color:#666;">기간: <b>{NMAX_LABEL}</b></div>
         <div style="font-size:22px; font-weight:900; margin-top:6px;">{pcx_text}</div>
         <div style="color:#999; font-size:12px; margin-top:6px;">
-          * 이 숫자는 PC에서 <b>{PCX_START_DATE.isoformat()} ~ 어제</b> 범위를 업로드했을 때만 표시됩니다.
+          * 이 숫자는 PC에서 <b>{NMAX_START_DATE.isoformat()} ~ 어제</b> 범위를 업로드했을 때만 표시됩니다.
         </div>
       </div>
 
@@ -1979,7 +2153,7 @@ def admin_login_page():
 
 @app.post("/admin-login")
 def admin_login_action(request: Request, password: str = Form(...)):
-    if password == ADMIN_PASSWORD:
+    if password == get_admin_password():
         request.session["is_admin"] = True
         return RedirectResponse("/dashboard", status_code=303)
 
@@ -3479,6 +3653,68 @@ def admin_roulette_history_csv(
 
 
 # -----------------------------
+# Full backup export/import
+# -----------------------------
+@app.get("/backup/export")
+def backup_export(request: Request):
+    # 로컬 PC 자동백업용: x-ingest-token 필요
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+    return get_backup_payload()
+
+
+@app.post("/backup/import")
+async def backup_import(request: Request, file: UploadFile = File(...)):
+    # 로컬/긴급 복원용: x-ingest-token 필요
+    auth = _require_ingest(request)
+    if auth:
+        return auth
+    raw = await file.read()
+    payload = json.loads(raw.decode("utf-8"))
+    return restore_backup_payload(payload)
+
+
+@app.get("/admin/backup/export")
+def admin_backup_export(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+    payload = get_backup_payload()
+    filename = f"riderwelfare_full_backup_{date.today().isoformat()}.json"
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/admin/backup/import")
+async def admin_backup_import(request: Request, file: UploadFile = File(...)):
+    r = require_admin(request)
+    if r:
+        return r
+    if not file.filename.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="json 백업 파일만 업로드 가능합니다.")
+    raw = await file.read()
+    payload = json.loads(raw.decode("utf-8"))
+    result = restore_backup_payload(payload)
+    body = f"""
+    <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:820px;margin:0 auto;">
+      <h3 style="margin-top:0;">전체 백업 복원 완료</h3>
+      <div style="color:#666;line-height:1.7;">
+        복원 전 안전백업: <b>{result.get('backup_before_restore')}</b><br/>
+        복원 파일: <b>{', '.join(result.get('restored_files') or [])}</b><br/>
+        룰렛 복원: <b>{result.get('roulette_result')}</b>
+      </div>
+      <div style="margin-top:12px;"><a href="/dashboard" style="text-decoration:none;color:#111;">대시보드로 이동</a></div>
+    </div>
+    """
+    return HTMLResponse(html_page("전체 백업 복원 완료", body))
+
+
+
+# -----------------------------
 # Diagnostics
 # -----------------------------
 @app.get("/health", response_class=HTMLResponse)
@@ -3489,7 +3725,7 @@ def health():
     status_keys = list((_read_json(STATUS_STORE, {}) or {}).keys())[:5]
     delivery_ts = _read_json(DELIVERY_STATUS_STORE, {}).get("ts")
 
-    pcx_from = PCX_START_DATE
+    pcx_from = NMAX_START_DATE
     pcx_to = date.today() - timedelta(days=1)
     pcx_ready = (pcx_from <= pcx_to) and has_status_range(pcx_from, pcx_to)
 
@@ -3502,7 +3738,7 @@ def health():
       <div>riders_ts: <b>{riders_ts}</b></div>
       <div>delivery_status_ts: <b>{delivery_ts}</b></div>
       <div style="margin-top:8px;">status_keys(sample): <b>{status_keys}</b></div>
-      <div style="margin-top:8px;">pcx_range_ready({PCX_START_DATE.isoformat()}~어제): <b>{pcx_ready}</b></div>
+      <div style="margin-top:8px;">pcx_range_ready({NMAX_START_DATE.isoformat()}~어제): <b>{pcx_ready}</b></div>
       <div style="margin-top:8px;">roulette_enabled: <b>{roulette_db.get_enabled()}</b></div>
       <div style="margin-top:8px;">roulette_segment_rows: <b>{len(roulette_export.get('segment_rewards', []))}</b></div>
       <div style="margin-top:12px;"><a href="/" style="text-decoration:none; color:#111;">&larr; 홈</a></div>
