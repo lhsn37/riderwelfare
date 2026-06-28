@@ -27,6 +27,23 @@ import time
 import zipfile
 from datetime import date, timedelta, datetime, timezone
 KST = timezone(timedelta(hours=9))
+
+# Render 서버 시간이 UTC여도 날짜/운영주차/표시시간은 한국시간으로 맞춥니다.
+os.environ.setdefault("TZ", "Asia/Seoul")
+try:
+    time.tzset()
+except Exception:
+    pass
+
+def today_kst() -> date:
+    return datetime.now(KST).date()
+
+def kst_from_epoch(ts_value: int | float | str | None) -> datetime:
+    try:
+        return datetime.fromtimestamp(int(ts_value or 0), KST)
+    except Exception:
+        return datetime.now(KST)
+
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -197,16 +214,66 @@ def is_ended_contract(rider: Dict[str, Any]) -> bool:
 # -----------------------------
 # Ratio helpers
 # -----------------------------
+def int0(v: Any) -> int:
+    try:
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
+def get_complete_count(dac: Dict[str, Any]) -> int:
+    """완료건수: 푸드 + 비마트 + 배민스토어 전체 완료.
+    v4는 totalComplete를 우선 사용하고, 없으면 세부 항목 합산, 마지막으로 구버전 complete를 사용합니다.
+    """
+    dac = dac or {}
+    if "totalComplete" in dac:
+        return int0(dac.get("totalComplete"))
+
+    if any(k in dac for k in ("foodComplete", "bmartComplete", "storeComplete")):
+        return (
+            int0(dac.get("foodComplete"))
+            + int0(dac.get("bmartComplete"))
+            + int0(dac.get("storeComplete"))
+        )
+
+    return int0(dac.get("complete"))
+
+
+def get_reject_count(dac: Dict[str, Any]) -> int:
+    """거절: 푸드 거절만 반영. 비마트/배민스토어 거절은 제외합니다."""
+    dac = dac or {}
+    if "foodReject" in dac:
+        return int0(dac.get("foodReject"))
+    return int0(dac.get("reject"))
+
+
+def get_cancel_count(dac: Dict[str, Any]) -> int:
+    """취소: 푸드 + 비마트 + 배민스토어 전체 취소."""
+    dac = dac or {}
+    if "totalCancel" in dac:
+        return int0(dac.get("totalCancel"))
+
+    if any(k in dac for k in ("foodCancel", "bmartCancel", "storeCancel")):
+        return (
+            int0(dac.get("foodCancel"))
+            + int0(dac.get("bmartCancel"))
+            + int0(dac.get("storeCancel"))
+        )
+
+    return int0(dac.get("cancel"))
+
+
 def calc_bad_ratio(complete: int, reject: int, cancel: int) -> Dict[str, Any]:
     complete = int(complete or 0)
     reject = int(reject or 0)
     cancel = int(cancel or 0)
 
-    total = complete + reject + cancel
+    # 관제와 동일 기준: (푸드 거절 + 전체 취소) / 전체 완료
+    total = complete
     bad = reject + cancel
 
-    if total > 0:
-        ratio = round((bad / total) * 100, 1)
+    if complete > 0:
+        ratio = round((bad / complete) * 100, 1)
     else:
         ratio = 0.0
 
@@ -249,9 +316,9 @@ def build_today_stats_map(ds: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             continue
 
         dac = row.get("deliveryAcceptanceCount") or {}
-        complete = int(dac.get("complete") or 0)
-        reject = int(dac.get("reject") or 0)
-        cancel = int(dac.get("cancel") or 0)
+        complete = get_complete_count(dac)
+        reject = get_reject_count(dac)
+        cancel = get_cancel_count(dac)
         ratio_info = calc_bad_ratio(complete, reject, cancel)
 
         st = row.get("status") or {}
@@ -264,7 +331,6 @@ def build_today_stats_map(ds: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         }
 
     return out
-
 
 # -----------------------------
 # Grade rules
@@ -327,7 +393,7 @@ def current_period(join_date: date, today: date) -> Tuple[date, date]:
 
 
 def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
-    api_max = date.today() - timedelta(days=1)
+    api_max = today_kst() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
     return from_d, to_d
@@ -420,7 +486,7 @@ def get_effective_join_date_by_login_key(rider: Dict[str, Any], login4: str) -> 
         except Exception:
             pass
 
-    return date.today(), "fallback"
+    return today_kst(), "fallback"
 
 
 # -----------------------------
@@ -1092,7 +1158,7 @@ def ingest_ranges(request: Request):
     if not isinstance(riders, list) or not riders:
         return {"ok": False, "error": "NO_RIDERS"}
 
-    today = date.today()
+    today = today_kst()
     ranges = set()
 
     for rr in riders:
@@ -1118,7 +1184,7 @@ def ingest_ranges(request: Request):
         ranges.add((prev_from.isoformat(), prev_to.isoformat()))
 
     pcx_from = NMAX_START_DATE
-    pcx_to = date.today() - timedelta(days=1)
+    pcx_to = today_kst() - timedelta(days=1)
     if pcx_from <= pcx_to:
         ranges.add((pcx_from.isoformat(), pcx_to.isoformat()))
 
@@ -1292,7 +1358,7 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = date.today()
+    today = today_kst()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     login_key = f"{name_in}|{rider_login4}"
 
@@ -1426,7 +1492,7 @@ def check(
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, join_src = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = date.today()
+    today = today_kst()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
@@ -1492,7 +1558,7 @@ def check(
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
     pcx_from = NMAX_START_DATE
-    pcx_to = date.today() - timedelta(days=1)
+    pcx_to = today_kst() - timedelta(days=1)
     pcx_text = "데이터 없음(업로드 필요)"
     if pcx_from <= pcx_to and has_status_range(pcx_from, pcx_to):
         cmap_pcx = fetch_status_complete_map_cached(pcx_from, pcx_to)
@@ -1529,7 +1595,7 @@ def check(
         ts_text = "-"
         if created_at:
             try:
-                ts_text = time.strftime("%m/%d %H:%M", time.localtime(created_at))
+                ts_text = kst_from_epoch(created_at).strftime("%m/%d %H:%M")
             except Exception:
                 ts_text = "-"
         recent_li += f"<li style='margin-bottom:4px;'>{ts_text} / {int(item.get('reward_amount') or 0):,}원 / {int(item.get('segment_value') or 0)}건 구간</li>"
@@ -1606,7 +1672,7 @@ def check(
               </span>
             </div>
             <div style="color:#777; font-weight:600; font-size:12px; margin-top:6px;">
-              운행기준: 완료 {today_completed} + 거절 {today_rejected} + 취소 {today_canceled} = 총 {today_total_attempt}건
+              계산기준: 완료 {today_completed}건 / 반영 거절+취소 {today_rejected + today_canceled}건
             </div>
             <div style="color:#777; font-weight:600; font-size:12px; margin-top:4px;">운행상태: {today_status_desc}</div>
           </div>
@@ -2366,7 +2432,7 @@ def plus_backup_excel(request: Request):
     wb.save(bio)
     bio.seek(0)
 
-    filename = f"riderwelfare_plus_backup_{date.today().isoformat()}.xlsx"
+    filename = f"riderwelfare_plus_backup_{today_kst().isoformat()}.xlsx"
     return StreamingResponse(
         bio,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2450,7 +2516,7 @@ def dashboard(request: Request, q: str = ""):
             continue
         rider_rows.append(rr)
 
-    today = date.today()
+    today = today_kst()
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
 
@@ -2877,7 +2943,7 @@ def dashboard_excel(request: Request):
     plannedplus_map = load_plannedplus_map()
     today_stats_map = build_today_stats_map(fetch_delivery_status_cached())
 
-    today = date.today()
+    today = today_kst()
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
 
@@ -3013,7 +3079,7 @@ def dashboard_excel(request: Request):
     wb.save(bio)
     bio.seek(0)
 
-    filename = f"riderwelfare_dashboard_{date.today().isoformat()}.xlsx"
+    filename = f"riderwelfare_dashboard_{today_kst().isoformat()}.xlsx"
     return StreamingResponse(
         bio,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3624,7 +3690,7 @@ def admin_roulette_history_csv(
             time_text = "-"
             if created_at:
                 try:
-                    time_text = time.strftime("%H:%M:%S", time.localtime(created_at))
+                    time_text = kst_from_epoch(created_at).strftime("%H:%M:%S")
                 except Exception:
                     time_text = "-"
 
@@ -3690,7 +3756,7 @@ def admin_backup_export(request: Request):
     if r:
         return r
     payload = get_backup_payload()
-    filename = f"riderwelfare_full_backup_{date.today().isoformat()}.json"
+    filename = f"riderwelfare_full_backup_{today_kst().isoformat()}.json"
     return Response(
         content=json.dumps(payload, ensure_ascii=False, indent=2),
         media_type="application/json; charset=utf-8",
@@ -3737,7 +3803,7 @@ def health():
     delivery_ts = _read_json(DELIVERY_STATUS_STORE, {}).get("ts")
 
     pcx_from = NMAX_START_DATE
-    pcx_to = date.today() - timedelta(days=1)
+    pcx_to = today_kst() - timedelta(days=1)
     pcx_ready = (pcx_from <= pcx_to) and has_status_range(pcx_from, pcx_to)
 
     roulette_export = roulette_db.export_json()
