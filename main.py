@@ -87,6 +87,7 @@ ADMIN_SETTINGS_FILE = "admin_settings.json"        # 관리자 비밀번호 등 
 
 ATTENDANCE_BONUS_PER_DAY = 5
 ATTENDANCE_MIN_TODAY_COMPLETE = 6
+MAX_PLUS_INPUT = 999999999
 
 NMAX_START_DATE = date(2026, 5, 28)
 NMAX_LABEL = "26.05.28 ~ (어제)"
@@ -951,9 +952,8 @@ def get_backup_payload() -> Dict[str, Any]:
     return {
         "ok": True,
         "service": "riderwelfare-render-backup",
-        "backup_format": 3,
+        "backup_format": 2,
         "created_at": int(time.time()),
-        "created_at_kst": datetime.now(KST).isoformat(),
         "event_name": EVENT_NAME,
         "event_start_date": NMAX_START_DATE.isoformat(),
         "event_label": NMAX_LABEL,
@@ -1061,13 +1061,13 @@ def _safe_int(v: Any, default: int = 0) -> int:
 
 def restore_plus_from_workbook(file_bytes: bytes) -> Tuple[int, int]:
     """
-    지원 컬럼:
-    - name
-    - login4
-    - prev_plus
-    - planned_plus
-    - sticker_attached (선택)
-    기존 dashboard.xlsx / plus-backup.xlsx 둘 다 복원 가능
+    플러스/스티커 복원.
+    우선순위:
+    1) 엑셀의 login_key가 현재 라이더 목록에 존재하면 그대로 사용
+    2) name + real4(배민 실제 뒷4자리)로 현재 라이더를 찾아 현재 login_key로 변환
+    3) name + login4로 현재 login_key 확인
+
+    이렇게 해야 로그인용 뒷4가 바뀌었거나 정렬이 달라도 다른 기사에게 플러스/스티커가 들어가지 않습니다.
     """
     wb = load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb.active
@@ -1079,48 +1079,79 @@ def restore_plus_from_workbook(file_bytes: bytes) -> Tuple[int, int]:
     headers = [str(h).strip() if h is not None else "" for h in rows[0]]
     idx = {h: i for i, h in enumerate(headers)}
 
-    required = ["name", "login4", "prev_plus", "planned_plus"]
-    missing = [k for k in required if k not in idx]
-    if missing:
-        raise ValueError(f"필수 컬럼 없음: {', '.join(missing)}")
+    if "name" not in idx:
+        raise ValueError("필수 컬럼 없음: name")
+    if "prev_plus" not in idx or "planned_plus" not in idx:
+        raise ValueError("필수 컬럼 없음: prev_plus / planned_plus")
 
-    prev_map: Dict[str, int] = {}
-    planned_map: Dict[str, int] = {}
-    sticker_map: Dict[str, bool] = {}
+    riders = fetch_riders_cached()
+    valid_login_keys: set[str] = set()
+    by_name_real4: Dict[str, str] = {}
+    by_name_login4: Dict[str, str] = {}
+
+    for rr in riders:
+        nm = rr.get("name") or ""
+        nn = norm_name(nm)
+        real4 = last4_from_phone(rr.get("phoneNumber") or "")
+        login4, _, _ = get_login4_for_rider(rr)
+        if not nn or not real4:
+            continue
+        login_key = f"{nn}|{login4}"
+        valid_login_keys.add(login_key)
+        by_name_real4[f"{nn}|{real4}"] = login_key
+        by_name_login4[f"{nn}|{login4}"] = login_key
+
+    prev_map = load_prevplus_map()
+    planned_map = load_plannedplus_map()
+    sticker_map = load_sticker_map()
 
     restored_rows = 0
+    skipped_rows = 0
+
+    def cell(row, name, default=""):
+        if name not in idx:
+            return default
+        i = idx[name]
+        return row[i] if i < len(row) else default
+
     for row in rows[1:]:
         if row is None:
             continue
 
-        name = row[idx["name"]] if idx["name"] < len(row) else None
-        login4 = row[idx["login4"]] if idx["login4"] < len(row) else None
-        prev_plus = row[idx["prev_plus"]] if idx["prev_plus"] < len(row) else None
-        planned_plus = row[idx["planned_plus"]] if idx["planned_plus"] < len(row) else None
-        sticker_attached = row[idx["sticker_attached"]] if "sticker_attached" in idx and idx["sticker_attached"] < len(row) else None
+        name_s = str(cell(row, "name", "") or "").strip()
+        if not name_s:
+            continue
+        nn = norm_name(name_s)
 
-        name_s = str(name).strip() if name is not None else ""
-        login4_s = str(login4).strip() if login4 is not None else ""
-        if not name_s or not re.fullmatch(r"\d{4}", login4_s):
+        login_key = str(cell(row, "login_key", "") or "").strip()
+        real4_s = str(cell(row, "real4", "") or "").strip()
+        login4_s = str(cell(row, "login4", "") or "").strip()
+
+        resolved_key = ""
+        if login_key and login_key in valid_login_keys:
+            resolved_key = login_key
+        elif real4_s and re.fullmatch(r"\d{4}", real4_s):
+            resolved_key = by_name_real4.get(f"{nn}|{real4_s}", "")
+        if not resolved_key and login4_s and re.fullmatch(r"\d{4}", login4_s):
+            resolved_key = by_name_login4.get(f"{nn}|{login4_s}", "")
+
+        if not resolved_key:
+            skipped_rows += 1
             continue
 
-        key = f"{norm_name(name_s)}|{login4_s}"
-        prev_map[key] = _safe_int(prev_plus, 0)
-        planned_map[key] = _safe_int(planned_plus, 0)
+        prev_map[resolved_key] = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, _safe_int(cell(row, "prev_plus", 0), 0)))
+        planned_map[resolved_key] = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, _safe_int(cell(row, "planned_plus", 0), 0)))
 
-        # 스티커 부착 여부는 선택 컬럼입니다.
-        # TRUE/1/예/yes/y/o/on/checked 등은 부착자로 처리합니다.
-        if sticker_attached is not None:
-            sv = str(sticker_attached).strip().lower()
-            sticker_map[key] = sv in {"1", "true", "y", "yes", "o", "on", "checked", "예", "네", "부착", "부착자"}
+        if "sticker_attached" in idx:
+            raw = str(cell(row, "sticker_attached", "") or "").strip().lower()
+            sticker_map[resolved_key] = raw in ("1", "true", "y", "yes", "o", "ok", "부착", "부착자")
 
         restored_rows += 1
 
     save_prevplus_map(prev_map)
     save_plannedplus_map(planned_map)
-    if sticker_map:
-        save_sticker_map(sticker_map)
-    return restored_rows, len(prev_map)
+    save_sticker_map(sticker_map)
+    return restored_rows, skipped_rows
 
 
 # -----------------------------
@@ -2333,7 +2364,7 @@ def admin_set_prevplus(request: Request, key: str = Form(...), prevplus: str = F
     if not key:
         return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
-    v = max(-999999999, min(999999999, v))
+    v = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, v))
     set_prevplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
@@ -2361,7 +2392,7 @@ def admin_set_plannedplus(request: Request, key: str = Form(...), plannedplus: s
     if not key:
         return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
-    v = max(-999999999, min(999999999, v))
+    v = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, v))
     set_plannedplus(key, v)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
 
@@ -2383,6 +2414,47 @@ def admin_set_sticker(
     checked = (sticker_attached == "1")
     set_sticker_attached(key, checked)
     return RedirectResponse(f"/dashboard?q={redirect_q}", status_code=303)
+
+
+@app.post("/admin/bulk-save-plus-sticker")
+async def admin_bulk_save_plus_sticker(request: Request):
+    r = require_admin(request)
+    if r:
+        return JSONResponse({"ok": False, "error": "UNAUTHORIZED"}, status_code=401)
+
+    payload = await request.json()
+    rows = payload.get("rows") or []
+    if not isinstance(rows, list):
+        return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
+
+    valid_keys: set[str] = set()
+    for rr in fetch_riders_cached():
+        nm = rr.get("name") or ""
+        login4, _, _ = get_login4_for_rider(rr)
+        if nm and login4:
+            valid_keys.add(f"{norm_name(nm)}|{login4}")
+
+    saved = 0
+    skipped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        key = str(row.get("key") or "").strip()
+        if key not in valid_keys:
+            skipped += 1
+            continue
+
+        prev_v = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, _safe_int(row.get("prevplus"), 0)))
+        planned_v = max(-MAX_PLUS_INPUT, min(MAX_PLUS_INPUT, _safe_int(row.get("plannedplus"), 0)))
+        sticker_v = bool(row.get("sticker"))
+
+        set_prevplus(key, prev_v)
+        set_plannedplus(key, planned_v)
+        set_sticker_attached(key, sticker_v)
+        saved += 1
+
+    return {"ok": True, "saved": saved, "skipped": skipped}
 
 @app.post("/admin/clear-plannedplus")
 def admin_clear_plannedplus(request: Request, key: str = Form(...), redirect_q: str = Form(default="")):
@@ -2422,11 +2494,12 @@ def plus_backup_excel(request: Request):
         key = f"{norm_name(name)}|{login4}"
         rows.append({
             "name": name,
+            "login_key": key,
             "login4": login4,
             "real4": real4,
             "prev_plus": int(prevplus_map.get(key, 0) or 0),
             "planned_plus": int(plannedplus_map.get(key, 0) or 0),
-            "sticker_attached": bool(sticker_map.get(key, False)),
+            "sticker_attached": 1 if bool(sticker_map.get(key, False)) else 0,
             "sticker_bonus": 20 if bool(sticker_map.get(key, False)) else 0,
         })
 
@@ -2436,7 +2509,7 @@ def plus_backup_excel(request: Request):
     ws = wb.active
     ws.title = "plus_backup"
 
-    headers = ["name", "login4", "real4", "prev_plus", "planned_plus", "sticker_attached", "sticker_bonus"]
+    headers = ["name", "login_key", "login4", "real4", "prev_plus", "planned_plus", "sticker_attached", "sticker_bonus"]
     ws.append(headers)
     for r0 in rows:
         ws.append([r0.get(h, "") for h in headers])
@@ -2481,8 +2554,8 @@ async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)
           <div style="color:#666; line-height:1.7;">
             업로드 파일: <b>{file.filename}</b><br/>
             처리 행 수: <b>{restored_rows}</b><br/>
-            저장된 키 수: <b>{saved_count}</b><br/>
-            이전등급 플러스 / 예정등급 플러스 / 스티커 부착 정보가 갱신되었습니다.
+            건너뛴 행 수: <b>{saved_count}</b><br/>
+            이전등급 플러스 / 예정등급 플러스 / 스티커가 현재 라이더 기준으로 갱신되었습니다.
           </div>
           <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
         </div>
@@ -2495,7 +2568,7 @@ async def admin_restore_plus_xlsx(request: Request, file: UploadFile = File(...)
           <div style="color:#666; line-height:1.7;">
             파일: <b>{file.filename}</b><br/>
             오류: <b>{str(e)}</b><br/>
-            업로드 엑셀에 <b>name / login4 / prev_plus / planned_plus</b> 컬럼이 있어야 합니다. sticker_attached 컬럼은 선택입니다.
+            업로드 엑셀에 <b>name / prev_plus / planned_plus</b> 컬럼이 필요합니다. real4 또는 login_key가 있으면 더 정확히 복원됩니다.
           </div>
           <div style="margin-top:14px;"><a href="/dashboard" style="text-decoration:none; color:#111;">← 대시보드로 돌아가기</a></div>
         </div>
@@ -2620,7 +2693,7 @@ def dashboard(request: Request, q: str = ""):
             planned_grade = grade_from_total(planned_total)
             current_grade = grade_from_total(prev_total)
 
-            nxt, remain = next_grade_target(cur_completed_raw)
+            nxt, remain = next_grade_target(planned_total)
 
             ov = join_overrides.get(it["login_key"])
             join_default_val = ov if ov else it["eff_join"].isoformat()
@@ -2688,7 +2761,7 @@ def dashboard(request: Request, q: str = ""):
     tr_html = ""
     for i, it in enumerate(final_rows, start=1):
         tr_html += f"""
-        <tr>
+        <tr class="bulk-row" data-key="{it['login_key']}">
           <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">{i}</td>
 
           <td style="padding:10px; border-bottom:1px solid #eee;">
@@ -2805,8 +2878,8 @@ def dashboard(request: Request, q: str = ""):
               <form method="post" action="/admin/set-prevplus" style="display:flex; gap:6px; align-items:center;">
                 <input type="hidden" name="key" value="{it['login_key']}" />
                 <input type="hidden" name="redirect_q" value="{q}" />
-                <input type="number" inputmode="numeric" name="prevplus" value="{it['prev_plus']}" placeholder="예: 20"
-                       style="width:110px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+                <input name="prevplus" class="bulk-prevplus" data-key="{it['login_key']}" value="{it['prev_plus']}" placeholder="예: 20"
+                       style="width:100px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
                 <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
               </form>
 
@@ -2828,8 +2901,8 @@ def dashboard(request: Request, q: str = ""):
               <form method="post" action="/admin/set-plannedplus" style="display:flex; gap:6px; align-items:center;">
                 <input type="hidden" name="key" value="{it['login_key']}" />
                 <input type="hidden" name="redirect_q" value="{q}" />
-                <input type="number" inputmode="numeric" name="plannedplus" value="{it['planned_plus_base']}" placeholder="예: 20"
-                       style="width:110px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
+                <input name="plannedplus" class="bulk-plannedplus" data-key="{it['login_key']}" value="{it['planned_plus_base']}" placeholder="예: 20"
+                       style="width:100px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
                 <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
               </form>
 
@@ -2844,7 +2917,7 @@ def dashboard(request: Request, q: str = ""):
               <input type="hidden" name="key" value="{it['login_key']}" />
               <input type="hidden" name="redirect_q" value="{q}" />
               <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:#111;">
-                <input type="checkbox" name="sticker_attached" value="1" {'checked' if it['sticker_attached'] else ''} />
+                <input type="checkbox" class="bulk-sticker" data-key="{it['login_key']}" name="sticker_attached" value="1" {'checked' if it['sticker_attached'] else ''} />
                 스티커부착자 (+20)
               </label>
               <button type="submit" style="padding:8px 10px; border:none; border-radius:10px; background:#111; color:#fff;">저장</button>
@@ -2909,8 +2982,52 @@ def dashboard(request: Request, q: str = ""):
       </div>
 
       <div style="margin-top:8px; color:#777; font-size:13px;">
-        * 기존 <b>dashboard.xlsx</b> 또는 <b>플러스 백업 엑셀</b> 업로드 가능 (필수 컬럼: name / login4 / prev_plus / planned_plus, 선택: sticker_attached)
+        * 기존 <b>dashboard.xlsx</b> 또는 <b>플러스 백업 엑셀</b> 업로드 가능 (권장 컬럼: name / login_key / real4 / prev_plus / planned_plus / sticker_attached)<br/>
+        * 예정등급 플러스 입력칸은 <b>수동 플러스</b>만 입력합니다. 스티커 +20은 자동으로 별도 합산됩니다.
       </div>
+
+      <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; background:#fff8e8; border:1px solid #ffe1a8; border-radius:12px; padding:10px 12px;">
+        <button type="button" onclick="bulkSavePlusSticker()"
+                style="font-size:15px; padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900; cursor:pointer;">
+          플러스/스티커 전체 저장
+        </button>
+        <span id="bulkSaveResult" style="font-size:13px; color:#666;">여러 명 수정 후 이 버튼 한 번만 누르면 됩니다.</span>
+      </div>
+
+      <script>
+      async function bulkSavePlusSticker() {{
+        // 행 단위로 읽습니다.
+        // CSS selector로 data-key를 다시 찾으면 한글/특수문자/중복 상황에서 잘못 매칭될 수 있어
+        // 같은 <tr> 안의 입력값만 묶어 저장합니다.
+        const rows = Array.from(document.querySelectorAll('tr.bulk-row')).map(tr => {{
+          const key = tr.dataset.key || '';
+          const prevEl = tr.querySelector('.bulk-prevplus');
+          const planEl = tr.querySelector('.bulk-plannedplus');
+          const stEl = tr.querySelector('.bulk-sticker');
+          return {{
+            key: key,
+            prevplus: prevEl ? prevEl.value : 0,
+            plannedplus: planEl ? planEl.value : 0,
+            sticker: stEl ? stEl.checked : false
+          }};
+        }}).filter(row => row.key);
+        const box = document.getElementById('bulkSaveResult');
+        box.textContent = '저장 중...';
+        try {{
+          const res = await fetch('/admin/bulk-save-plus-sticker', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{rows: rows}})
+          }});
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || '저장 실패');
+          box.textContent = '저장 완료: ' + data.saved + '명 / 건너뜀 ' + data.skipped + '명. 새로고침 중...';
+          setTimeout(() => location.reload(), 600);
+        }} catch (e) {{
+          box.textContent = '저장 실패: ' + e.message;
+        }}
+      }}
+      </script>
 
       <div style="margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px;">
         <table style="border-collapse:collapse; width:100%; min-width:2350px;">
@@ -3000,8 +3117,8 @@ def dashboard_excel(request: Request):
             "prev_api_from": prev_from.isoformat(),
             "prev_api_to": prev_to.isoformat(),
             "prev_plus": int(prevplus_map.get(login_key, 0) or 0),
-            "planned_plus_base": int(plannedplus_map.get(login_key, 0) or 0),
-            "sticker_attached": bool(sticker_map.get(login_key, False)),
+            "planned_plus": int(plannedplus_map.get(login_key, 0) or 0),
+            "sticker_attached": 1 if bool(sticker_map.get(login_key, False)) else 0,
             "sticker_bonus": 20 if bool(sticker_map.get(login_key, False)) else 0,
         }
 
@@ -3030,16 +3147,14 @@ def dashboard_excel(request: Request):
             cur_raw = int(cmap.get(it["real_key"], 0))
             prev_raw = int(prev_completed_map.get(it["real_key"], 0))
             prev_plus = int(it["prev_plus"])
-            planned_plus_base = int(it.get("planned_plus_base", 0) or 0)
-            sticker_bonus = int(it.get("sticker_bonus", 0) or 0)
-            planned_plus = planned_plus_base + sticker_bonus
+            planned_plus = int(it["planned_plus"])
 
             prev_total_for_grade = prev_raw + prev_plus
             planned_total_for_grade = cur_raw + planned_plus
 
             planned_grade = grade_from_total(planned_total_for_grade)
             current_grade = grade_from_total(prev_total_for_grade)
-            nxt, remain = next_grade_target(cur_raw)
+            nxt, remain = next_grade_target(planned_total_for_grade)
 
             today_info = today_stats_map.get(it["real_key"]) or {
                 "complete": 0,
@@ -3063,11 +3178,7 @@ def dashboard_excel(request: Request):
                 "today_ratio": float(today_info["ratio"]),
                 "cur_completed": cur_raw,
                 "prev_plus": prev_plus,
-                "planned_plus": planned_plus_base,
-                "planned_plus_base": planned_plus_base,
-                "sticker_attached": bool(it.get("sticker_attached", False)),
-                "sticker_bonus": sticker_bonus,
-                "planned_plus_total": planned_plus,
+                "planned_plus": planned_plus,
                 "planned_total_for_grade": planned_total_for_grade,
                 "planned_grade_cur": planned_grade,
                 "prev_completed": prev_raw,
@@ -3088,7 +3199,7 @@ def dashboard_excel(request: Request):
         "policy_from", "policy_to", "api_from", "api_to",
         "today_complete", "today_reject", "today_cancel", "today_ratio",
         "cur_completed",
-        "prev_plus", "planned_plus", "planned_plus_base", "sticker_attached", "sticker_bonus", "planned_plus_total",
+        "prev_plus", "planned_plus",
         "planned_total_for_grade", "planned_grade_cur",
         "prev_completed", "prev_total_for_grade", "current_grade_prev",
         "next", "remain",
