@@ -52,15 +52,6 @@ def today_str(now: Optional[datetime] = None) -> str:
     return operation_datetime(now).strftime("%Y-%m-%d")
 
 
-def operation_date_from_epoch(ts_value: int | float | str | None) -> str:
-    """created_at(epoch)를 기준으로 06:00 운영일 문자열을 계산합니다."""
-    try:
-        created = datetime.fromtimestamp(int(ts_value or 0), KST) if KST else datetime.fromtimestamp(int(ts_value or 0))
-    except Exception:
-        created = now_kst()
-    return today_str(created)
-
-
 def get_operational_cycle_bounds(now: Optional[datetime] = None) -> Dict[str, Any]:
     """
     운영 주차 기준
@@ -306,47 +297,14 @@ class RouletteDB:
                 """, self._build_default_segment_rewards())
                 conn.commit()
 
-            # 기존 자정 기준으로 저장된 룰렛 이력을 06:00 운영일 기준으로 자동 보정
-            self._normalize_existing_spin_dates_6am(conn)
-
             conn.close()
 
-    def _normalize_existing_spin_dates_6am(self, conn: sqlite3.Connection) -> int:
-        """기존 DB의 룰렛 이력을 06:00 운영일 기준으로 보정합니다.
-
-        과거 코드가 자정 기준으로 저장한 00:00~05:59 당첨 이력은
-        다음날 날짜로 들어가 있어 오늘 사용횟수에 잘못 포함됩니다.
-        created_at 기준으로 spin_date와 week_key를 다시 계산해 보정합니다.
-        """
-        try:
-            rows = conn.execute("""
-                SELECT id, spin_date, week_key, created_at
-                FROM roulette_spins
-                WHERE created_at IS NOT NULL AND created_at > 0
-            """).fetchall()
-        except Exception:
-            return 0
-
-        updated = 0
-        for row in rows:
-            try:
-                created_dt = datetime.fromtimestamp(int(row["created_at"]), KST) if KST else datetime.fromtimestamp(int(row["created_at"]))
-                new_spin_date = today_str(created_dt)
-                new_week_key = get_operational_cycle_bounds(created_dt)["cycle_key"]
-
-                if str(row["spin_date"] or "") != new_spin_date or str(row["week_key"] or "") != new_week_key:
-                    conn.execute("""
-                        UPDATE roulette_spins
-                        SET spin_date = ?, week_key = ?
-                        WHERE id = ?
-                    """, (new_spin_date, new_week_key, int(row["id"])))
-                    updated += 1
-            except Exception:
-                continue
-
-        if updated:
+    def _set_if_missing(self, conn: sqlite3.Connection, key: str, value: str):
+        cur = conn.cursor()
+        row = cur.execute("SELECT key FROM settings WHERE key = ?", (key,)).fetchone()
+        if not row:
+            cur.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
             conn.commit()
-        return updated
 
     # -------------------------
     # settings
