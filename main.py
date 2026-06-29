@@ -35,8 +35,31 @@ try:
 except Exception:
     pass
 
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
 def today_kst() -> date:
-    return datetime.now(KST).date()
+    return now_kst().date()
+
+def operation_date(now: datetime | None = None) -> date:
+    """라웰 운영일 기준 날짜. 매일 오전 06:00에 새 운영일로 전환됩니다.
+
+    예) 6/28 05:59 -> 6/27 운영일, 6/28 06:00 -> 6/28 운영일
+    출석체크/룰렛/오늘완료 기준일에 사용합니다.
+    """
+    if now is None:
+        now = now_kst()
+    if now.hour < 6:
+        return (now - timedelta(days=1)).date()
+    return now.date()
+
+def operation_day_bounds(op_date: date | None = None) -> tuple[datetime, datetime]:
+    """운영일의 시작/종료 시각(KST): 06:00 ~ 다음날 05:59:59."""
+    if op_date is None:
+        op_date = operation_date()
+    start = datetime(op_date.year, op_date.month, op_date.day, 6, 0, 0, tzinfo=KST)
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return start, end
 
 def kst_from_epoch(ts_value: int | float | str | None) -> datetime:
     try:
@@ -56,12 +79,38 @@ from openpyxl.utils import get_column_letter
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import StreamingResponse
 
+import roulette_db as roulette_db_module
 from roulette_db import (
     RouletteDB,
     normalize_phone,
     get_operational_cycle_bounds,
     get_previous_operational_cycle_bounds,
 )
+
+# roulette_db 내부에서 date.today()/datetime.now()를 쓰는 경우에도
+# 라웰 운영일(06:00~다음날 05:59) 기준으로 동작하도록 보정합니다.
+# 함수 객체는 그대로 사용하되, roulette_db 모듈의 전역 date/datetime 참조만 교체합니다.
+class _OperationalDate(date):
+    @classmethod
+    def today(cls):
+        d = operation_date()
+        return cls(d.year, d.month, d.day)
+
+
+class _OperationalDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        base = now_kst()
+        if tz is not None:
+            base = base.astimezone(tz)
+        return cls.fromtimestamp(base.timestamp(), base.tzinfo)
+
+
+try:
+    roulette_db_module.date = _OperationalDate
+    roulette_db_module.datetime = _OperationalDateTime
+except Exception:
+    pass
 
 # -----------------------------
 # Config
@@ -394,7 +443,7 @@ def current_period(join_date: date, today: date) -> Tuple[date, date]:
 
 
 def period_to_from_to(start_d: date, end_inclusive: date) -> Tuple[date, date]:
-    api_max = today_kst() - timedelta(days=1)
+    api_max = operation_date() - timedelta(days=1)
     from_d = start_d
     to_d = min(end_inclusive, api_max)
     return from_d, to_d
@@ -1202,7 +1251,7 @@ def ingest_ranges(request: Request):
     if not isinstance(riders, list) or not riders:
         return {"ok": False, "error": "NO_RIDERS"}
 
-    today = today_kst()
+    today = operation_date()
     ranges = set()
 
     for rr in riders:
@@ -1228,7 +1277,7 @@ def ingest_ranges(request: Request):
         ranges.add((prev_from.isoformat(), prev_to.isoformat()))
 
     pcx_from = NMAX_START_DATE
-    pcx_to = today_kst() - timedelta(days=1)
+    pcx_to = operation_date() - timedelta(days=1)
     if pcx_from <= pcx_to:
         ranges.add((pcx_from.isoformat(), pcx_to.isoformat()))
 
@@ -1301,7 +1350,7 @@ def home():
       <div style="color:#888; margin-top:12px; font-size:13px;">
         * 완료건수는 ‘어제까지’ 반영됩니다. (등급용)<br/>
         * 출석체크는 ‘오늘 완료건수’ 기준입니다. (실시간)<br/>
-        * 룰렛은 ‘오늘 완료건수’ 기준으로 10건당 1회 가능합니다.
+        * 룰렛/출석은 라웰 운영일 기준(06:00~다음날 05:59)으로 초기화됩니다.
       </div>
     </div>
     """
@@ -1402,7 +1451,7 @@ def attendance_check(request: Request, name: str = Form(...), login4: str = Form
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, _ = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = today_kst()
+    today = operation_date()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     login_key = f"{name_in}|{rider_login4}"
 
@@ -1536,7 +1585,7 @@ def check(
     rider_login4, rider_real4, _ = get_login4_for_rider(rider)
     eff_join_date, join_src = get_effective_join_date_by_login_key(rider, rider_login4)
 
-    today = today_kst()
+    today = operation_date()
     cur_start, cur_end_incl = current_period(eff_join_date, today)
     cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
 
@@ -1602,7 +1651,7 @@ def check(
     join_note = "관리자 설정" if join_src == "override" else "배민 입사일"
 
     pcx_from = NMAX_START_DATE
-    pcx_to = today_kst() - timedelta(days=1)
+    pcx_to = operation_date() - timedelta(days=1)
     pcx_text = "데이터 없음(업로드 필요)"
     if pcx_from <= pcx_to and has_status_range(pcx_from, pcx_to):
         cmap_pcx = fetch_status_complete_map_cached(pcx_from, pcx_to)
@@ -2605,7 +2654,7 @@ def dashboard(request: Request, q: str = ""):
             continue
         rider_rows.append(rr)
 
-    today = today_kst()
+    today = operation_date()
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
 
@@ -3077,7 +3126,7 @@ def dashboard_excel(request: Request):
     sticker_map = load_sticker_map()
     today_stats_map = build_today_stats_map(fetch_delivery_status_cached())
 
-    today = today_kst()
+    today = operation_date()
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
 
@@ -3939,7 +3988,7 @@ def health():
     delivery_ts = _read_json(DELIVERY_STATUS_STORE, {}).get("ts")
 
     pcx_from = NMAX_START_DATE
-    pcx_to = today_kst() - timedelta(days=1)
+    pcx_to = operation_date() - timedelta(days=1)
     pcx_ready = (pcx_from <= pcx_to) and has_status_range(pcx_from, pcx_to)
 
     roulette_export = roulette_db.export_json()
