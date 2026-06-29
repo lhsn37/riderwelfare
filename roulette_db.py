@@ -8,6 +8,13 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+KST = ZoneInfo("Asia/Seoul") if ZoneInfo else None
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,9 +30,26 @@ def normalize_phone(phone: str) -> str:
     return "".join(ch for ch in str(phone or "") if ch.isdigit())
 
 
+def now_kst() -> datetime:
+    """현재 한국시간 반환. 서버 시간이 UTC여도 룰렛 기준은 한국시간으로 고정합니다."""
+    if KST:
+        return datetime.now(KST)
+    return datetime.now()
+
+
+def operation_datetime(now: Optional[datetime] = None) -> datetime:
+    """라웰 운영일 기준 datetime. 00:00~05:59는 전날 운영일로 봅니다."""
+    now = now or now_kst()
+    if KST and now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    if now.hour < 6:
+        return now - timedelta(days=1)
+    return now
+
+
 def today_str(now: Optional[datetime] = None) -> str:
-    now = now or datetime.now()
-    return now.strftime("%Y-%m-%d")
+    """룰렛/출석 운영일 문자열. 기준: 06:00 ~ 다음날 05:59."""
+    return operation_datetime(now).strftime("%Y-%m-%d")
 
 
 def get_operational_cycle_bounds(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -37,7 +61,7 @@ def get_operational_cycle_bounds(now: Optional[datetime] = None) -> Dict[str, An
 
     주차 판정 경계는 수요일 03:00 으로 처리
     """
-    now = now or datetime.now()
+    now = now or now_kst()
 
     # 수요일 03:00 이전 구간은 이전 운영 주차로 묶기 위해 3시간 차감
     pivot = now - timedelta(hours=3)
@@ -68,7 +92,7 @@ def get_operational_cycle_bounds(now: Optional[datetime] = None) -> Dict[str, An
 
 
 def get_previous_operational_cycle_bounds(now: Optional[datetime] = None) -> Dict[str, Any]:
-    now = now or datetime.now()
+    now = now or now_kst()
     current = get_operational_cycle_bounds(now)
     current_anchor = datetime.strptime(current["cycle_key"], "%Y-%m-%d")
     prev_anchor = current_anchor - timedelta(days=7)
@@ -97,7 +121,7 @@ def is_roulette_open_now(now: Optional[datetime] = None) -> bool:
     """
     수요일 03:00 ~ 05:59 는 운영 공백으로 보고 룰렛 비활성화
     """
-    now = now or datetime.now()
+    now = now or now_kst()
     return not (now.weekday() == 2 and 3 <= now.hour < 6)
 
 
@@ -867,7 +891,7 @@ class RouletteDB:
     # backup / export
     # -------------------------
     def create_backup(self) -> Dict[str, Any]:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = now_kst().strftime("%Y%m%d_%H%M%S")
         backup_file = self.backup_dir / f"roulette_backup_{ts}.db"
 
         with DB_LOCK:
@@ -888,7 +912,7 @@ class RouletteDB:
         }
 
     def save_json_backup_on_disk(self, prefix: str = "roulette_backup") -> Dict[str, Any]:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = now_kst().strftime("%Y%m%d_%H%M%S")
         backup_file = self.backup_dir / f"{prefix}_{ts}.json"
         payload = self.export_json()
         backup_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
