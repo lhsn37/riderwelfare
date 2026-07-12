@@ -1334,7 +1334,14 @@ def ingest_ranges(request: Request):
             d = max(min(starts), yesterday - timedelta(days=119))
             while d <= yesterday:
                 key = f"{d.isoformat()}_{d.isoformat()}"
-                if key not in status_store:
+                saved = status_store.get(key) if isinstance(status_store, dict) else None
+                # 예전 completeMap만 저장된 날짜도 historyMap이 없으면 다시 수집합니다.
+                has_history = (
+                    isinstance(saved, dict)
+                    and isinstance(saved.get("historyMap"), dict)
+                    and len(saved.get("historyMap") or {}) > 0
+                )
+                if not has_history:
                     ranges.add((d.isoformat(), d.isoformat()))
                 d += timedelta(days=1)
     except Exception as e:
@@ -5387,15 +5394,22 @@ def team_page(request: Request, day: str = ""):
     team_start = safe_date_parse(str(team.get("team_start_date") or ""))
     if team_start is None:
         team_start = safe_date_parse(str(team.get("created_at") or "")[:10]) or operation_date()
-    op_day = min(requested_day, operation_date())
-    if op_day < team_start:
-        op_day = team_start
+
+    leader_mode = is_team_leader(team, login_key)
+    today_op = operation_date()
+    # 팀장은 팀 생성일부터 전체 기록을 조회할 수 있습니다.
+    # 일반 팀원은 오늘과 최근 7일 전까지(과거 일주일)만 조회할 수 있습니다.
+    member_min_day = max(team_start, today_op - timedelta(days=7))
+    allowed_min_day = team_start if leader_mode else member_min_day
+
+    op_day = min(requested_day, today_op)
+    if op_day < allowed_min_day:
+        op_day = allowed_min_day
     ws = current_team_week_start(op_day)
     rec = team_week_record(str(team.get("id")), ws)
     set_count = int(rec.get("set_count") or 0) if rec.get("status") in ("approved", "pending") else 0
     quota = team_quota(op_day, set_count)
     totals, member_rows, historical_daily = aggregate_team_day(team, op_day)
-    leader_mode = is_team_leader(team, login_key)
     leader_name = directory.get(str(team.get("leader_key") or ""), {}).get("name", "-")
 
     period_rows = ""
@@ -5448,12 +5462,13 @@ def team_page(request: Request, day: str = ""):
                     for p in TEAM_PERIODS
                 )
             else:
+                # 배민 API는 구간별 거절/취소를 제공하지 않으므로 구간 상세에는 완료만 표시합니다.
                 details = "<br>".join(
-                    f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}"
+                    f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)}"
                     for p in TEAM_PERIODS
                 )
                 detail_cards = "".join(
-                    f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>거절 {(parts.get(p) or {}).get('reject',0)} · 취소 {(parts.get(p) or {}).get('cancel',0)}</small></div>"
+                    f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>완료건수</small></div>"
                     for p in TEAM_PERIODS
                 )
             mrows += f"<tr><td>{_team_escape(info.get('name'))}<div class='role'>{role}</div></td><td>{complete}</td><td>{reject}</td><td>{cancel}</td><td>{ratio}%</td><td class='detail-cell'>{details}</td></tr>"
@@ -5486,10 +5501,10 @@ def team_page(request: Request, day: str = ""):
           </form>
         </section>"""
 
-    prev_day = max(team_start, op_day - timedelta(days=1))
-    next_day = min(operation_date(), op_day + timedelta(days=1))
-    prev_disabled = op_day <= team_start
-    next_disabled = op_day >= operation_date()
+    prev_day = max(allowed_min_day, op_day - timedelta(days=1))
+    next_day = min(today_op, op_day + timedelta(days=1))
+    prev_disabled = op_day <= allowed_min_day
+    next_disabled = op_day >= today_op
     progress = round(day_complete / day_quota * 100, 1) if day_quota else 0
 
     body = f"""
@@ -5572,7 +5587,7 @@ def team_page(request: Request, day: str = ""):
       <div class='team-nav'><a href='/'>등급조회</a><a href='/team'><b>팀 페이지</b></a><a href='/team-logout'>로그아웃</a></div>
       <section class='hero'>
         <h2>{_team_escape(team.get('name'))}</h2>
-        <div class='sub'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · 팀 생성일 {team_start} · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
+        <div class='sub'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · 팀 생성일 {team_start} · {'팀장 전체기간 조회' if leader_mode else '팀원 최근 7일 조회'}</div>
         <div class='date-nav'><a href='/team?day={prev_day}' style='{"pointer-events:none;opacity:.35" if prev_disabled else ""}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}' style='{"pointer-events:none;opacity:.35" if next_disabled else ""}'>다음날 →</a></div>
         <div class='summary-grid'>
           <div class='team-card'>신청 세트<b>{set_count}세트</b></div>
