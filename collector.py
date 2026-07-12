@@ -16,6 +16,11 @@ INGEST_TOKEN = os.getenv("INGEST_TOKEN", "").strip()
 CENTER_ID = os.getenv("BAEMIN_CENTER_ID", "").strip()
 STATE_FILE = os.getenv("BAEMIN_STATE_FILE", "storage_state.json").strip().strip('"')
 CUM_START_DATE = os.getenv("CUM_START_DATE", "2025-11-26").strip()
+HISTORY_PAGE_DELAY_SEC = float(os.getenv("HISTORY_PAGE_DELAY_SEC", "0.35"))
+FETCH_RETRY_COUNT = max(1, int(os.getenv("FETCH_RETRY_COUNT", "3")))
+SYNC_INTERVAL_SEC = max(60, int(os.getenv("SYNC_INTERVAL_SEC", "60")))
+# 팀 과거기록은 연결 안정성을 위해 기본 1일씩만 저장합니다.
+HISTORY_DAY_DELAY_SEC = max(1.0, float(os.getenv("HISTORY_DAY_DELAY_SEC", "5")))
 
 # 기본은 브라우저 띄우기(권장)
 HEADLESS = os.getenv("HEADLESS", "0").strip() not in ("0", "false", "False", "")
@@ -89,16 +94,11 @@ def _browser_like_headers():
 
 
 def _fetch_json_in_page(page, url: str, headers: dict, timeout_ms: int = 30000):
-    """
-    ✅ 핵심: 브라우저 페이지 컨텍스트에서 fetch() 실행
-    - credentials: 'include' 로 쿠키 포함
-    - Cloudflare는 브라우저 요청은 통과시키는 경우가 많음
-    """
+    """브라우저 페이지 컨텍스트에서 fetch하고 일시 오류는 재시도합니다."""
     js = """
     async ({ url, headers, timeoutMs }) => {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
       try {
         const res = await fetch(url, {
           method: "GET",
@@ -106,16 +106,15 @@ def _fetch_json_in_page(page, url: str, headers: dict, timeout_ms: int = 30000):
           credentials: "include",
           signal: ctrl.signal,
         });
-
         const ct = res.headers.get("content-type") || "";
         const text = await res.text();
-
-        // JSON이면 파싱
         if (ct.includes("application/json")) {
-          return { ok: res.ok, status: res.status, ct, json: JSON.parse(text), head: "" };
+          try {
+            return { ok: res.ok, status: res.status, ct, json: JSON.parse(text), head: "" };
+          } catch (e) {
+            return { ok: false, status: res.status, ct, json: null, head: text.slice(0, 800) };
+          }
         }
-
-        // HTML(Cloudflare) 등
         return { ok: res.ok, status: res.status, ct, json: null, head: text.slice(0, 800) };
       } catch (e) {
         return { ok: false, status: 0, ct: "", json: null, head: String(e) };
@@ -124,10 +123,25 @@ def _fetch_json_in_page(page, url: str, headers: dict, timeout_ms: int = 30000):
       }
     }
     """
-    out = page.evaluate(js, {"url": url, "headers": headers, "timeoutMs": timeout_ms})
-    if not out.get("ok") or out.get("json") is None:
-        raise RuntimeError(f"FETCH_HTTP_{out.get('status')} CT={out.get('ct')} HEAD={out.get('head')}")
-    return out["json"]
+
+    last_error = None
+    for attempt in range(1, FETCH_RETRY_COUNT + 1):
+        try:
+            result = page.evaluate(js, {"url": url, "headers": headers, "timeoutMs": timeout_ms})
+            if result.get("ok") and result.get("json") is not None:
+                return result["json"]
+            last_error = RuntimeError(
+                f"FETCH_HTTP_{result.get('status')} CT={result.get('ct')} HEAD={result.get('head')}"
+            )
+        except Exception as exc:
+            last_error = exc
+
+        if attempt < FETCH_RETRY_COUNT:
+            wait_sec = min(5.0, 0.8 * attempt)
+            print(f"[collector] fetch retry {attempt}/{FETCH_RETRY_COUNT}: {url}")
+            page.wait_for_timeout(int(wait_sec * 1000))
+
+    raise RuntimeError(str(last_error or "FETCH_FAILED"))
 
 
 def fetch_riders(page):
@@ -227,6 +241,10 @@ def fetch_status_range(page, fromDate: str, toDate: str):
         if page_no > 800:
             break
 
+        # 과거 API를 연속으로 너무 빠르게 호출하지 않습니다.
+        if HISTORY_PAGE_DELAY_SEC > 0:
+            page.wait_for_timeout(int(HISTORY_PAGE_DELAY_SEC * 1000))
+
     return complete_map, history_map
 
 
@@ -282,27 +300,44 @@ def main_loop():
                 ranges_resp = get_ranges()
                 ranges = list(ranges_resp.get("ranges") or []) if ranges_resp.get("ok") else []
 
-                # 2.5) 누적 range
-                cum_from = CUM_START_DATE
-                cum_to = (today_kst() - timedelta(days=1)).isoformat()
-                if cum_from <= cum_to:
-                    if not any(r.get("fromDate") == cum_from and r.get("toDate") == cum_to for r in ranges):
-                        ranges.append({"fromDate": cum_from, "toDate": cum_to})
-
-                # 3) status 수집
+                # 2.5) 과거 범위는 Render가 "없는 범위"만 내려줍니다.
+                # collector에서 임의로 누적 범위를 매번 추가하지 않습니다.
+                unique_ranges = []
+                seen_ranges = set()
                 for rg in ranges:
+                    fd = str(rg.get("fromDate") or "")
+                    td = str(rg.get("toDate") or "")
+                    key = f"{fd}_{td}"
+                    if not fd or not td or key in seen_ranges:
+                        continue
+                    seen_ranges.add(key)
+                    unique_ranges.append({
+                        "fromDate": fd, "toDate": td,
+                        "kind": str(rg.get("kind") or "status"),
+                    })
+
+                if unique_ranges:
+                    print(f"[collector] missing history ranges={len(unique_ranges)}")
+
+                # 3) 누락된 과거 status만 수집
+                for rg in unique_ranges:
                     fd = rg["fromDate"]
                     td = rg["toDate"]
+                    kind = str(rg.get("kind") or "status")
                     cm, hm = fetch_status_range(page, fd, td)
                     post_json(
                         "/ingest/status",
                         {
                             "fromDate": fd,
                             "toDate": td,
+                            "kind": kind,
                             "completeMap": cm,
                             "historyMap": hm,
                         },
                     )
+                    print(f"[collector] {kind} saved {fd} ~ {td} riders={len(hm)}")
+                    if kind == "team_history" and HISTORY_DAY_DELAY_SEC > 0:
+                        page.wait_for_timeout(int(HISTORY_DAY_DELAY_SEC * 1000))
 
                 context.close()
                 browser.close()
@@ -312,7 +347,7 @@ def main_loop():
         except Exception as e:
             print("ERR", type(e).__name__, e)
 
-        time.sleep(60)
+        time.sleep(SYNC_INTERVAL_SEC)
 
 
 if __name__ == "__main__":

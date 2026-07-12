@@ -181,6 +181,9 @@ ADMIN_SETTINGS_FILE = str(STORE_DIR / ADMIN_SETTINGS_FILE)
 RIDERS_STORE = STORE_DIR / "store_riders.json"
 STATUS_STORE = STORE_DIR / "store_status.json"
 DELIVERY_STATUS_STORE = STORE_DIR / "store_delivery_status.json"
+# 팀 과거 개인기록은 날짜별 파일로 분리 저장합니다.
+TEAM_HISTORY_DIR = STORE_DIR / "team_history"
+TEAM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # 룰렛 DB
 roulette_db = RouletteDB(str(STORE_DIR))
@@ -861,7 +864,68 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
     return out
 
 
+def team_history_path(day_value: date | str) -> Path:
+    day_text = day_value.isoformat() if isinstance(day_value, date) else str(day_value)
+    return TEAM_HISTORY_DIR / f"{day_text}.json"
+
+
+def load_team_history_day(day_value: date | str) -> Dict[str, Any]:
+    raw = _read_json(team_history_path(day_value), {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_team_history_day(day_text: str, complete_map: Dict[str, Any], history_map: Dict[str, Any]) -> None:
+    payload = {
+        "date": day_text,
+        "completeMap": complete_map if isinstance(complete_map, dict) else {},
+        "historyMap": history_map if isinstance(history_map, dict) else {},
+        "updated_at": now_kst().isoformat(),
+    }
+    _write_json(team_history_path(day_text), payload)
+
+
+def has_team_history_day(day_value: date | str) -> bool:
+    raw = load_team_history_day(day_value)
+    return isinstance(raw.get("historyMap"), dict) and len(raw.get("historyMap") or {}) > 0
+
+
+def team_history_progress() -> Dict[str, Any]:
+    yesterday = operation_date() - timedelta(days=1)
+    starts: List[date] = []
+    for team in load_teams():
+        if not team.get("active", True):
+            continue
+        td = safe_date_parse(str(team.get("team_start_date") or ""))
+        if td is None:
+            td = safe_date_parse(str(team.get("created_at") or "")[:10])
+        if td is not None:
+            starts.append(td)
+    if not starts or min(starts) > yesterday:
+        return {"start": None, "end": yesterday.isoformat(), "total": 0, "saved": 0, "missing": 0, "percent": 100}
+    start = min(starts)
+    total = (yesterday - start).days + 1
+    saved = 0
+    d = start
+    while d <= yesterday:
+        if has_team_history_day(d):
+            saved += 1
+        d += timedelta(days=1)
+    return {
+        "start": start.isoformat(), "end": yesterday.isoformat(),
+        "total": total, "saved": saved, "missing": max(0, total - saved),
+        "percent": round(saved / total * 100, 1) if total else 100,
+    }
+
+
 def fetch_status_history_map(from_d: date, to_d: date) -> Dict[str, Dict[str, Any]]:
+    # 하루 단위 팀 과거기록은 날짜별 파일을 최우선으로 읽습니다.
+    if from_d == to_d:
+        daily = load_team_history_day(from_d)
+        hm = daily.get("historyMap") if isinstance(daily, dict) else {}
+        if isinstance(hm, dict) and hm:
+            return hm
+
+    # 기존 store_status.json에 저장된 자료도 호환합니다.
     key = f"{from_d.isoformat()}_{to_d.isoformat()}"
     all_status = _read_json(STATUS_STORE, {}) or {}
     raw = all_status.get(key) or {}
@@ -1020,6 +1084,13 @@ def get_backup_payload() -> Dict[str, Any]:
         except Exception as e:
             files[path.name] = {"_backup_error": str(e)}
 
+    history_files = {}
+    try:
+        for hp in sorted(TEAM_HISTORY_DIR.glob("*.json")):
+            history_files[hp.name] = json.loads(hp.read_text(encoding="utf-8"))
+    except Exception as e:
+        history_files = {"_backup_error": str(e)}
+
     try:
         roulette_payload = roulette_db.export_json()
     except Exception as e:
@@ -1039,6 +1110,7 @@ def get_backup_payload() -> Dict[str, Any]:
             "ADMIN_PASSWORD": get_admin_password(),
         },
         "files": files,
+        "team_history_files": history_files,
         "roulette": roulette_payload,
     }
 
@@ -1092,6 +1164,14 @@ def restore_backup_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         save_admin_settings(settings)
         if "admin_settings.json" not in restored_files:
             restored_files.append("admin_settings.json")
+
+    history_files = payload.get("team_history_files") or {}
+    if isinstance(history_files, dict) and "_backup_error" not in history_files:
+        TEAM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        for name, data in history_files.items():
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", str(name)):
+                continue
+            (TEAM_HISTORY_DIR / str(name)).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     roulette_result = None
     roulette_payload = payload.get("roulette")
@@ -1287,8 +1367,9 @@ def ingest_ranges(request: Request):
         return {"ok": False, "error": "NO_RIDERS"}
 
     today = operation_date()
-    ranges = set()
+    requested_ranges = set()
 
+    # 등급/NMAX 범위는 기존 방식 그대로 유지합니다.
     for rr in riders:
         if not isinstance(rr, dict):
             continue
@@ -1296,32 +1377,41 @@ def ingest_ranges(request: Request):
         real4 = last4_from_phone(ph)
         if not real4:
             continue
-
         login4, _, _ = get_login4_for_rider(rr)
         eff_join, _ = get_effective_join_date_by_login_key(rr, login4)
-
         cur_start, cur_end_incl = current_period(eff_join, today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
-
         prev_end_incl = cur_start - timedelta(days=1)
         prev_m = date(cur_start.year, cur_start.month, 1) + relativedelta(months=-1)
         prev_start = clamp_day(prev_m.year, prev_m.month, eff_join.day)
         prev_from, prev_to = period_to_from_to(prev_start, prev_end_incl)
+        if cur_from <= cur_to:
+            requested_ranges.add((cur_from.isoformat(), cur_to.isoformat()))
+        if prev_from <= prev_to:
+            requested_ranges.add((prev_from.isoformat(), prev_to.isoformat()))
 
-        ranges.add((cur_from.isoformat(), cur_to.isoformat()))
-        ranges.add((prev_from.isoformat(), prev_to.isoformat()))
+    nmax_from = NMAX_START_DATE
+    nmax_to = operation_date() - timedelta(days=1)
+    if nmax_from <= nmax_to:
+        requested_ranges.add((nmax_from.isoformat(), nmax_to.isoformat()))
 
-    pcx_from = NMAX_START_DATE
-    pcx_to = operation_date() - timedelta(days=1)
-    if pcx_from <= pcx_to:
-        ranges.add((pcx_from.isoformat(), pcx_to.isoformat()))
+    status_store = _read_json(STATUS_STORE, {}) or {}
+    out = []
+    for from_d, to_d in sorted(requested_ranges):
+        key = f"{from_d}_{to_d}"
+        saved = status_store.get(key) if isinstance(status_store, dict) else None
+        if isinstance(saved, dict) and "completeMap" in saved:
+            is_saved = isinstance(saved.get("completeMap"), dict)
+        else:
+            is_saved = isinstance(saved, dict) and len(saved) > 0
+        if not is_saved:
+            out.append({"fromDate": from_d, "toDate": to_d, "kind": "status"})
 
-    # 팀 과거 조회용: 활성 팀의 생성일부터 어제까지 하루 단위 개인기록을 요청합니다.
-    # 이미 업로드된 날짜는 다시 요청하지 않아 collector 부하를 줄입니다.
+    # 팀 과거기록은 가장 오래된 누락 날짜 딱 1개만 요청합니다.
+    # 최초 백필도 하루씩 진행되고, 완료 후에는 매일 어제 자료 1개만 자동 저장됩니다.
     try:
-        status_store = _read_json(STATUS_STORE, {}) or {}
         yesterday = operation_date() - timedelta(days=1)
-        starts = []
+        starts: List[date] = []
         for team in load_teams():
             if not team.get("active", True):
                 continue
@@ -1331,24 +1421,17 @@ def ingest_ranges(request: Request):
             if td is not None:
                 starts.append(td)
         if starts:
-            d = max(min(starts), yesterday - timedelta(days=119))
+            d = min(starts)
             while d <= yesterday:
-                key = f"{d.isoformat()}_{d.isoformat()}"
-                saved = status_store.get(key) if isinstance(status_store, dict) else None
-                # 예전 completeMap만 저장된 날짜도 historyMap이 없으면 다시 수집합니다.
-                has_history = (
-                    isinstance(saved, dict)
-                    and isinstance(saved.get("historyMap"), dict)
-                    and len(saved.get("historyMap") or {}) > 0
-                )
-                if not has_history:
-                    ranges.add((d.isoformat(), d.isoformat()))
+                if not has_team_history_day(d):
+                    out.append({"fromDate": d.isoformat(), "toDate": d.isoformat(), "kind": "team_history"})
+                    break
                 d += timedelta(days=1)
     except Exception as e:
-        print("TEAM RANGE BUILD ERROR:", e)
+        print("TEAM HISTORY RANGE ERROR:", e)
 
-    out = [{"fromDate": a, "toDate": b} for (a, b) in sorted(ranges)]
-    return {"ok": True, "ranges": out, "count": len(out)}
+    progress = team_history_progress()
+    return {"ok": True, "ranges": out, "count": len(out), "history_progress": progress}
 
 
 @app.post("/ingest/status")
@@ -1360,6 +1443,7 @@ async def ingest_status(request: Request):
     payload = await request.json()
     from_d = payload.get("fromDate")
     to_d = payload.get("toDate")
+    kind = str(payload.get("kind") or "status")
     complete_map = payload.get("completeMap")
     history_map = payload.get("historyMap") or {}
 
@@ -1368,21 +1452,33 @@ async def ingest_status(request: Request):
     if not isinstance(history_map, dict):
         history_map = {}
 
+    # 팀 과거 개인기록은 날짜별 JSON 파일에 저장합니다.
+    if kind == "team_history" and from_d == to_d:
+        save_team_history_day(from_d, complete_map, history_map)
+
+    # 등급/NMAX 호환용 completeMap은 기존 store_status.json에 유지합니다.
+    # 대용량 historyMap은 날짜별 파일로 분리하여 store_status.json 비대화를 막습니다.
     all_status = _read_json(STATUS_STORE, {})
     key = f"{from_d}_{to_d}"
-    all_status[key] = {
+    old = all_status.get(key) if isinstance(all_status, dict) else None
+    entry = {
         "completeMap": complete_map,
-        "historyMap": history_map,
         "updated_at": now_kst().isoformat(),
     }
+    # 예전 호출 또는 비일일 범위에서 전달된 historyMap은 호환상 보존하되,
+    # team_history는 날짜 파일에만 저장합니다.
+    if kind != "team_history" and history_map:
+        entry["historyMap"] = history_map
+    elif isinstance(old, dict) and isinstance(old.get("historyMap"), dict) and old.get("historyMap"):
+        entry["historyMap"] = old.get("historyMap")
+    all_status[key] = entry
     _write_json(STATUS_STORE, all_status)
 
     _status_cache.pop(key, None)
     return {
-        "ok": True,
-        "key": key,
-        "count": len(complete_map),
-        "history_count": len(history_map),
+        "ok": True, "key": key, "kind": kind,
+        "count": len(complete_map), "history_count": len(history_map),
+        "history_file": str(team_history_path(from_d).name) if kind == "team_history" and from_d == to_d else "",
     }
 
 
@@ -5233,8 +5329,19 @@ def admin_teams_page(request: Request, edit_id: str = ""):
           <form method='post' action='/admin/team-delete' style='margin-top:10px' onsubmit="return confirm('팀을 해체하시겠습니까?')"><input type='hidden' name='team_id' value='{_team_escape(t.get('id'))}'><button style='border:1px solid #ddd;background:#fff;border-radius:8px;padding:7px 10px'>팀 해체</button></form>
         </div>"""
 
+    hp = team_history_progress()
+    history_box = f"""
+    <div style='background:#fff;border:1px solid #e5e5e5;border-radius:14px;padding:14px;margin-bottom:14px'>
+      <div style='display:flex;justify-content:space-between;gap:10px'><b>팀 과거기록 자동 저장</b><b>{hp.get('percent',100)}%</b></div>
+      <div style='height:10px;background:#eee;border-radius:999px;overflow:hidden;margin-top:10px'><i style='display:block;height:100%;width:{min(100,float(hp.get("percent",100)))}%;background:#111'></i></div>
+      <div style='color:#666;font-size:13px;margin-top:8px'>저장 {hp.get('saved',0)}/{hp.get('total',0)}일 · 남음 {hp.get('missing',0)}일 · {hp.get('start') or '-'} ~ {hp.get('end') or '-'}</div>
+      <div style='color:#888;font-size:12px;margin-top:5px'>누락된 가장 오래된 날짜부터 하루씩 자동 저장합니다.</div>
+    </div>
+    """
+
     body = f"""
     {_team_nav(True)}
+    {history_box}
     <div style='display:grid;grid-template-columns:minmax(320px,1fr) minmax(360px,1.3fr);gap:16px;align-items:start'>
       <div><h2 style='margin-top:0'>팀 구성 관리</h2>{team_cards or '<div>생성된 팀이 없습니다.</div>'}</div>
       <div style='background:#fff;border:1px solid #e5e5e5;border-radius:16px;padding:16px'>
