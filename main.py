@@ -372,12 +372,23 @@ def build_today_stats_map(ds: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         cancel = get_cancel_count(dac)
         ratio_info = calc_bad_ratio(complete, reject, cancel)
 
+        peak = row.get("deliveryPeakTimeCount") or {}
+        hourly = row.get("hourlyCompleted") or []
+        peak_complete = {
+            "morning_lunch": int0(peak.get("morning")),
+            "afternoon_offpeak": int0(peak.get("afternoon")),
+            "dinner_peak": int0(peak.get("evening")),
+            "late_night": int0(peak.get("midnight")),
+        }
+
         st = row.get("status") or {}
         out[f"{nm}|{real4}"] = {
             "complete": complete,
             "reject": reject,
             "cancel": cancel,
             "status_desc": st.get("desc") or "-",
+            "peak_complete": peak_complete,
+            "hourly_completed": hourly if isinstance(hourly, list) else [],
             **ratio_info,
         }
 
@@ -1292,6 +1303,30 @@ def ingest_ranges(request: Request):
     pcx_to = operation_date() - timedelta(days=1)
     if pcx_from <= pcx_to:
         ranges.add((pcx_from.isoformat(), pcx_to.isoformat()))
+
+    # 팀 과거 조회용: 활성 팀의 생성일부터 어제까지 하루 단위 개인기록을 요청합니다.
+    # 이미 업로드된 날짜는 다시 요청하지 않아 collector 부하를 줄입니다.
+    try:
+        status_store = _read_json(STATUS_STORE, {}) or {}
+        yesterday = operation_date() - timedelta(days=1)
+        starts = []
+        for team in load_teams():
+            if not team.get("active", True):
+                continue
+            td = safe_date_parse(str(team.get("team_start_date") or ""))
+            if td is None:
+                td = safe_date_parse(str(team.get("created_at") or "")[:10])
+            if td is not None:
+                starts.append(td)
+        if starts:
+            d = max(min(starts), yesterday - timedelta(days=119))
+            while d <= yesterday:
+                key = f"{d.isoformat()}_{d.isoformat()}"
+                if key not in status_store:
+                    ranges.add((d.isoformat(), d.isoformat()))
+                d += timedelta(days=1)
+    except Exception as e:
+        print("TEAM RANGE BUILD ERROR:", e)
 
     out = [{"fromDate": a, "toDate": b} for (a, b) in sorted(ranges)]
     return {"ok": True, "ranges": out, "count": len(out)}
@@ -4885,6 +4920,15 @@ def team_period_for_datetime(now: datetime | None = None) -> str:
     return "dinner_peak"
 
 
+def previous_team_period(period: str) -> str:
+    order = list(TEAM_PERIODS)
+    try:
+        idx = order.index(period)
+    except ValueError:
+        return period
+    return order[idx - 1] if idx > 0 else "late_night"
+
+
 def team_period_time_text(op_day: date, period: str) -> str:
     weekend = op_day.weekday() in (5, 6)
     if period == "morning_lunch":
@@ -4944,10 +4988,11 @@ def team_week_record(team_id: str, week_start: date | None = None) -> Dict[str, 
 
 
 def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
-    """Persist deltas of today's cumulative counters into the current operating period.
+    """배민 v4 응답의 기사별 구간 완료건수를 그대로 저장합니다.
 
-    This works with the existing collector payload, which contains cumulative daily totals.
-    Calling this on every /ingest/delivery-status upload splits those totals by period.
+    deliveryPeakTimeCount의 morning/afternoon/evening/midnight 값을 사용하므로
+    Render 재배포 시점이나 최초 수집 시각과 관계없이 완료건수가 정확한 구간에 표시됩니다.
+    거절·취소는 API에 구간별 값이 없으므로 이전 누적값 대비 증분만 현재 구간에 기록합니다.
     """
     try:
         ds = delivery_data if isinstance(delivery_data, dict) else fetch_delivery_status_cached()
@@ -4955,7 +5000,7 @@ def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
         directory = rider_directory()
         now = now_kst()
         op_day = operation_date(now)
-        period = team_period_for_datetime(now)
+        current_period = team_period_for_datetime(now)
         payload = load_team_period_stats()
         snapshots = payload.setdefault("snapshots", {})
         stats = payload.setdefault("stats", {})
@@ -4968,24 +5013,38 @@ def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
                 "reject": int(cur.get("reject") or 0),
                 "cancel": int(cur.get("cancel") or 0),
             }
+            peak_complete = cur.get("peak_complete") or {}
+
+            # 완료건수는 배민이 제공하는 구간별 누적값으로 매번 덮어씁니다.
+            # 기존에 잘못 배정된 완료건수도 다음 수집 즉시 정상 구간으로 교정됩니다.
+            for period in TEAM_PERIODS:
+                stat_key = f"{op_day.isoformat()}|{period}|{login_key}"
+                row = stats.get(stat_key) or {"complete": 0, "reject": 0, "cancel": 0}
+                row["complete"] = max(0, int(peak_complete.get(period) or 0))
+                row["updated_at"] = now.isoformat()
+                row["complete_source"] = "deliveryPeakTimeCount"
+                stats[stat_key] = row
+
+            # 거절·취소는 구간별 API 값이 없으므로 증분만 현재 구간에 더합니다.
             snap_key = f"{op_day.isoformat()}|{login_key}"
-            prev = snapshots.get(snap_key) or {"complete": 0, "reject": 0, "cancel": 0}
-            deltas = {}
-            for field in ("complete", "reject", "cancel"):
+            prev = snapshots.get(snap_key) if isinstance(snapshots.get(snap_key), dict) else {}
+            stat_key = f"{op_day.isoformat()}|{current_period}|{login_key}"
+            row = stats.get(stat_key) or {"complete": 0, "reject": 0, "cancel": 0}
+            for field in ("reject", "cancel"):
                 old = int(prev.get(field) or 0)
                 new = int(current[field])
-                # Collector/day reset protection: on reset, use current value as new delta.
-                deltas[field] = new - old if new >= old else new
-
-            stat_key = f"{op_day.isoformat()}|{period}|{login_key}"
-            row = stats.get(stat_key) or {"complete": 0, "reject": 0, "cancel": 0}
-            for field in ("complete", "reject", "cancel"):
-                row[field] = int(row.get(field) or 0) + max(0, int(deltas[field]))
+                delta = new - old if new >= old else new
+                row[field] = int(row.get(field) or 0) + max(0, delta)
             row["updated_at"] = now.isoformat()
             stats[stat_key] = row
-            snapshots[snap_key] = {**current, "updated_at": now.isoformat(), "period": period}
 
-        # Keep a practical history window.
+            snapshots[snap_key] = {
+                **current,
+                "updated_at": now.isoformat(),
+                "period": current_period,
+                "peak_api": True,
+            }
+
         cutoff = op_day - timedelta(days=120)
         payload["stats"] = {
             k: v for k, v in stats.items()
@@ -5004,13 +5063,30 @@ def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, i
     payload = load_team_period_stats()
     all_stats = payload.get("stats") or {}
     out = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
+    has_period_data = False
     for period in TEAM_PERIODS:
         row = all_stats.get(f"{op_day.isoformat()}|{period}|{login_key}") or {}
+        if row:
+            has_period_data = True
         out[period] = {
             "complete": int(row.get("complete") or 0),
             "reject": int(row.get("reject") or 0),
             "cancel": int(row.get("cancel") or 0),
         }
+
+    # 과거 스냅샷이 없으면 collector가 크롤링한 해당 날짜의 개인 완료건수를 사용합니다.
+    # 과거 API는 일일 합계만 주므로 첫 칸을 '일일 전체' 용도로 사용하고 구간별 값으로 위장하지 않습니다.
+    if not has_period_data and op_day < operation_date():
+        directory = rider_directory()
+        info = directory.get(login_key) or {}
+        name = info.get("name") or ""
+        real4 = info.get("real4") or ""
+        api_key = f"{norm_name(name)}|{real4}" if name and real4 else ""
+        if api_key:
+            daily_map = fetch_status_complete_map_cached(op_day, op_day)
+            if api_key in daily_map:
+                out["morning_lunch"]["complete"] = int(daily_map.get(api_key) or 0)
+                out["_meta"] = {"historical_daily": 1}  # type: ignore[assignment]
     return out
 
 
@@ -5020,16 +5096,19 @@ def team_all_keys(team: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys([x for x in keys if x]))
 
 
-def aggregate_team_day(team: Dict[str, Any], op_day: date) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, Dict[str, int]]]]:
+def aggregate_team_day(team: Dict[str, Any], op_day: date) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, Dict[str, int]]], bool]:
     period_total = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
     member_rows: Dict[str, Dict[str, Dict[str, int]]] = {}
+    historical_daily = False
     for key in team_all_keys(team):
         member_stats = team_member_day_stats(key, op_day)
+        if isinstance(member_stats.get("_meta"), dict) and member_stats.get("_meta", {}).get("historical_daily"):
+            historical_daily = True
         member_rows[key] = member_stats
         for p in TEAM_PERIODS:
             for f in ("complete", "reject", "cancel"):
                 period_total[p][f] += int(member_stats[p][f])
-    return period_total, member_rows
+    return period_total, member_rows, historical_daily
 
 
 def _team_escape(s: Any) -> str:
@@ -5260,29 +5339,32 @@ def team_page(request: Request, day: str = ""):
     rec = team_week_record(str(team.get("id")), ws)
     set_count = int(rec.get("set_count") or 0) if rec.get("status") in ("approved", "pending") else 0
     quota = team_quota(op_day, set_count)
-    totals, member_rows = aggregate_team_day(team, op_day)
+    totals, member_rows, historical_daily = aggregate_team_day(team, op_day)
     leader_mode = is_team_leader(team, login_key)
     leader_name = directory.get(str(team.get("leader_key") or ""), {}).get("name", "-")
 
     period_rows = ""
     period_cards = ""
     day_complete = day_reject = day_cancel = day_quota = 0
-    for p in TEAM_PERIODS:
-        q = quota[p]
-        c = totals[p]["complete"]
-        rj = totals[p]["reject"]
-        ca = totals[p]["cancel"]
+    display_periods = ("morning_lunch",) if historical_daily else TEAM_PERIODS
+    for p in display_periods:
+        q = sum(quota.values()) if historical_daily else quota[p]
+        c = sum(totals[x]["complete"] for x in TEAM_PERIODS) if historical_daily else totals[p]["complete"]
+        rj = sum(totals[x]["reject"] for x in TEAM_PERIODS) if historical_daily else totals[p]["reject"]
+        ca = sum(totals[x]["cancel"] for x in TEAM_PERIODS) if historical_daily else totals[p]["cancel"]
+        label = "일일 전체 개인기록" if historical_daily else TEAM_PERIOD_LABELS[p]
+        time_text = "배민 과거 개인기록 합산" if historical_daily else team_period_time_text(op_day,p)
         day_complete += c
         day_reject += rj
         day_cancel += ca
         day_quota += q
         rate = round(c / q * 100, 1) if q else 0
-        period_rows += f"<tr><td>{TEAM_PERIOD_LABELS[p]}</td><td>{team_period_time_text(op_day,p)}</td><td><b>{c}</b> / {q}</td><td>{rj}</td><td>{ca}</td><td>{rate}%</td></tr>"
+        period_rows += f"<tr><td>{label}</td><td>{time_text}</td><td><b>{c}</b> / {q}</td><td>{rj if not historical_daily else '-'}</td><td>{ca if not historical_daily else '-'}</td><td>{rate}%</td></tr>"
         period_cards += f"""
         <div class='period-card'>
-          <div class='period-card-head'><b>{TEAM_PERIOD_LABELS[p]}</b><span>{team_period_time_text(op_day,p)}</span></div>
+          <div class='period-card-head'><b>{label}</b><span>{time_text}</span></div>
           <div class='period-main'><strong>{c}</strong><span>/ {q}건</span><em>{rate}%</em></div>
-          <div class='period-sub'><span>거절 <b>{rj}</b></span><span>취소 <b>{ca}</b></span></div>
+          <div class='period-sub'>{"<span>과거 날짜는 개인 완료건수 합계로 표시</span>" if historical_daily else f"<span>거절 <b>{rj}</b></span><span>취소 <b>{ca}</b></span>"}</div>
         </div>"""
 
     member_table = ""
@@ -5297,14 +5379,18 @@ def team_page(request: Request, day: str = ""):
             cancel = sum(int((parts.get(p) or {}).get("cancel") or 0) for p in TEAM_PERIODS)
             ratio = round((reject + cancel) / complete * 100, 1) if complete else 0
             role = "팀장" if k == team.get("leader_key") else "팀원"
-            details = "<br>".join(
-                f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}"
-                for p in TEAM_PERIODS
-            )
-            detail_cards = "".join(
-                f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>거절 {(parts.get(p) or {}).get('reject',0)} · 취소 {(parts.get(p) or {}).get('cancel',0)}</small></div>"
-                for p in TEAM_PERIODS
-            )
+            if historical_daily:
+                details = f"일일 전체 완료: {complete}건"
+                detail_cards = f"<div><span>일일 전체</span><b>{complete}</b><small>배민 과거 개인기록</small></div>"
+            else:
+                details = "<br>".join(
+                    f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}"
+                    for p in TEAM_PERIODS
+                )
+                detail_cards = "".join(
+                    f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>거절 {(parts.get(p) or {}).get('reject',0)} · 취소 {(parts.get(p) or {}).get('cancel',0)}</small></div>"
+                    for p in TEAM_PERIODS
+                )
             mrows += f"<tr><td>{_team_escape(info.get('name'))}<div class='role'>{role}</div></td><td>{complete}</td><td>{reject}</td><td>{cancel}</td><td>{ratio}%</td><td class='detail-cell'>{details}</td></tr>"
             member_cards += f"""
             <div class='member-card'>
