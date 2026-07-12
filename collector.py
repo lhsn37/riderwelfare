@@ -21,6 +21,9 @@ FETCH_RETRY_COUNT = max(1, int(os.getenv("FETCH_RETRY_COUNT", "3")))
 SYNC_INTERVAL_SEC = max(60, int(os.getenv("SYNC_INTERVAL_SEC", "60")))
 # 팀 과거기록은 연결 안정성을 위해 기본 1일씩만 저장합니다.
 HISTORY_DAY_DELAY_SEC = max(1.0, float(os.getenv("HISTORY_DAY_DELAY_SEC", "5")))
+# 비정상 수집이 정상 데이터를 덮어쓰지 못하도록 하는 안전 기준
+MIN_RIDER_COUNT = max(1, int(os.getenv("MIN_RIDER_COUNT", "50")))
+MIN_DELIVERY_STATUS_COUNT = max(1, int(os.getenv("MIN_DELIVERY_STATUS_COUNT", "30")))
 
 # 기본은 브라우저 띄우기(권장)
 HEADLESS = os.getenv("HEADLESS", "0").strip() not in ("0", "false", "False", "")
@@ -256,6 +259,52 @@ def normalize_riders(j):
     return []
 
 
+def validate_riders_for_ingest(riders):
+    """빈 응답·로그인 만료·API 형식 변경 시 서버 덮어쓰기를 차단합니다."""
+    if not isinstance(riders, list):
+        raise RuntimeError("RIDERS_INVALID_TYPE")
+    valid = []
+    identities = set()
+    for rider in riders:
+        if not isinstance(rider, dict):
+            continue
+        name = str(rider.get("name") or "").strip()
+        phone = str(rider.get("phoneNumber") or "").replace(" ", "")
+        if not name or len(phone) < 4:
+            continue
+        key = (name.replace(" ", "").lower(), phone[-4:])
+        identities.add(key)
+        valid.append(rider)
+    if len(valid) < MIN_RIDER_COUNT:
+        raise RuntimeError(
+            f"RIDERS_SAFETY_BLOCK count={len(valid)} minimum={MIN_RIDER_COUNT}"
+        )
+    if len(identities) < MIN_RIDER_COUNT:
+        raise RuntimeError(
+            f"RIDERS_DUPLICATE_OR_INVALID unique={len(identities)} minimum={MIN_RIDER_COUNT}"
+        )
+    return valid
+
+
+def validate_delivery_status_for_ingest(data):
+    """실시간 현황이 비어 있거나 일부만 내려오면 업로드하지 않습니다."""
+    if not isinstance(data, dict):
+        raise RuntimeError("DELIVERY_STATUS_INVALID_TYPE")
+    rows = data.get("data") or []
+    if not isinstance(rows, list):
+        raise RuntimeError("DELIVERY_STATUS_ROWS_INVALID")
+    valid_count = sum(
+        1 for row in rows
+        if isinstance(row, dict) and str(row.get("name") or "").strip()
+    )
+    if valid_count < MIN_DELIVERY_STATUS_COUNT:
+        raise RuntimeError(
+            f"DELIVERY_STATUS_SAFETY_BLOCK count={valid_count} "
+            f"minimum={MIN_DELIVERY_STATUS_COUNT}"
+        )
+    return data
+
+
 def main_loop():
     if not INGEST_TOKEN:
         raise SystemExit("INGEST_TOKEN env가 필요합니다.")
@@ -289,12 +338,14 @@ def main_loop():
 
                 # 1) riders
                 riders_j = fetch_riders(page)
-                riders_list = normalize_riders(riders_j)
-                post_json("/ingest/riders", {"riders": riders_list})
+                riders_list = validate_riders_for_ingest(normalize_riders(riders_j))
+                riders_result = post_json("/ingest/riders", {"riders": riders_list})
+                print(f"[collector] riders accepted={riders_result.get('count', len(riders_list))}")
 
                 # 1.5) delivery-status
-                ds_j = fetch_delivery_status(page)
-                post_json("/ingest/delivery-status", {"data": ds_j})
+                ds_j = validate_delivery_status_for_ingest(fetch_delivery_status(page))
+                ds_result = post_json("/ingest/delivery-status", {"data": ds_j})
+                print(f"[collector] delivery-status accepted={ds_result.get('count', '-')}")
 
                 # 2) ranges
                 ranges_resp = get_ranges()

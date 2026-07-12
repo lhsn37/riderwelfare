@@ -119,6 +119,11 @@ RIDERS_CACHE_TTL = 10
 STATUS_CACHE_TTL = 10
 DELIVERY_STATUS_CACHE_TTL = 5
 
+# 수집 오류가 기존 정상 데이터를 초기화하지 못하도록 하는 서버측 안전 기준
+MIN_RIDERS_INGEST = max(1, int(os.getenv("MIN_RIDERS_INGEST", "50")))
+MIN_DELIVERY_STATUS_INGEST = max(1, int(os.getenv("MIN_DELIVERY_STATUS_INGEST", "30")))
+MIN_INGEST_RATIO = min(1.0, max(0.1, float(os.getenv("MIN_INGEST_RATIO", "0.65"))))
+
 RATE_WINDOW_SEC = 60
 RATE_MAX_REQ = 30
 
@@ -808,7 +813,40 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    """임시 파일에 완전히 기록한 뒤 원자적으로 교체합니다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _backup_store_file(path: Path) -> None:
+    """정상 데이터 교체 직전에 직전본 1개를 보관합니다."""
+    if not path.exists():
+        return
+    backup = path.with_name(path.name + ".last_good")
+    tmp = backup.with_name(backup.name + ".tmp")
+    tmp.write_bytes(path.read_bytes())
+    os.replace(tmp, backup)
+
+
+def _valid_rider_identity_count(riders: List[Dict[str, Any]]) -> int:
+    keys = set()
+    for rider in riders:
+        if not isinstance(rider, dict):
+            continue
+        name = norm_name(rider.get("name") or "")
+        real4 = last4_from_phone(rider.get("phoneNumber") or "")
+        if name and real4:
+            keys.add(f"{name}|{real4}")
+    return len(keys)
+
+
+def _delivery_status_row_count(data: Dict[str, Any]) -> int:
+    rows = data.get("data") or []
+    if not isinstance(rows, list):
+        return 0
+    return sum(1 for row in rows if isinstance(row, dict) and norm_name(row.get("name") or ""))
 
 
 def _require_ingest(request: Request):
@@ -1247,10 +1285,29 @@ async def ingest_riders(request: Request):
     if not isinstance(riders, list):
         return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
 
+    valid_count = _valid_rider_identity_count(riders)
+    current = _read_json(RIDERS_STORE, {"riders": []})
+    old_riders = current.get("riders") or [] if isinstance(current, dict) else []
+    old_count = _valid_rider_identity_count(old_riders) if isinstance(old_riders, list) else 0
+    required = MIN_RIDERS_INGEST
+    if old_count > 0:
+        required = max(required, int(old_count * MIN_INGEST_RATIO))
+
+    if valid_count < required:
+        print(f"INGEST RIDERS BLOCKED new={valid_count} old={old_count} required={required}")
+        return JSONResponse({
+            "ok": False,
+            "error": "RIDERS_SAFETY_BLOCK",
+            "new_count": valid_count,
+            "old_count": old_count,
+            "required": required,
+        }, status_code=409)
+
+    _backup_store_file(RIDERS_STORE)
     _write_json(RIDERS_STORE, {"ts": time.time(), "riders": riders})
     _riders_cache["ts"] = 0.0
     _riders_cache["data"] = None
-    return {"ok": True, "count": len(riders)}
+    return {"ok": True, "count": valid_count, "previous_count": old_count}
 
 
 @app.post("/ingest/delivery-status")
@@ -1264,15 +1321,33 @@ async def ingest_delivery_status(request: Request):
     if not isinstance(data, dict):
         return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
 
+    new_count = _delivery_status_row_count(data)
+    current = _read_json(DELIVERY_STATUS_STORE, {"data": {}})
+    old_data = current.get("data") if isinstance(current, dict) else {}
+    old_count = _delivery_status_row_count(old_data) if isinstance(old_data, dict) else 0
+    required = MIN_DELIVERY_STATUS_INGEST
+    if old_count > 0:
+        required = max(required, int(old_count * MIN_INGEST_RATIO))
+
+    if new_count < required:
+        print(f"INGEST DELIVERY STATUS BLOCKED new={new_count} old={old_count} required={required}")
+        return JSONResponse({
+            "ok": False,
+            "error": "DELIVERY_STATUS_SAFETY_BLOCK",
+            "new_count": new_count,
+            "old_count": old_count,
+            "required": required,
+        }, status_code=409)
+
+    _backup_store_file(DELIVERY_STATUS_STORE)
     _write_json(DELIVERY_STATUS_STORE, {"ts": time.time(), "data": data})
     _delivery_status_cache["ts"] = 0.0
     _delivery_status_cache["data"] = None
-    # 팀 구간별 집계: 오늘 누적값의 증분을 현재 구간에 저장합니다.
     try:
         capture_team_snapshot(data)
     except Exception as e:
         print("TEAM SNAPSHOT INGEST ERROR:", e)
-    return {"ok": True}
+    return {"ok": True, "count": new_count, "previous_count": old_count}
 
 
 @app.get("/ingest/ranges")
@@ -1383,6 +1458,21 @@ async def ingest_status(request: Request):
 
     all_status = _read_json(STATUS_STORE, {})
     key = f"{from_d}_{to_d}"
+    existing = all_status.get(key) if isinstance(all_status, dict) else None
+    existing_map = existing.get("completeMap") if isinstance(existing, dict) else None
+    old_count = len(existing_map) if isinstance(existing_map, dict) else 0
+    new_count = len(complete_map)
+    required = MIN_RIDERS_INGEST
+    if old_count > 0:
+        required = max(required, int(old_count * MIN_INGEST_RATIO))
+    if new_count < required:
+        print(f"INGEST STATUS BLOCKED key={key} new={new_count} old={old_count} required={required}")
+        return JSONResponse({
+            "ok": False, "error": "STATUS_SAFETY_BLOCK",
+            "key": key, "new_count": new_count, "old_count": old_count, "required": required,
+        }, status_code=409)
+
+    _backup_store_file(STATUS_STORE)
     all_status[key] = {
         "completeMap": complete_map,
         "historyMap": history_map,
