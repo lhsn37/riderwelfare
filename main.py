@@ -160,6 +160,7 @@ STORE_DIR.mkdir(parents=True, exist_ok=True)
 _STATE_FILES = [
     OVERRIDE_FILE, LOGIN4_FILE, PREVPLUS_FILE, PLANNEDPLUS_FILE,
     ATTENDANCE_FILE, STICKER_FILE, ADMIN_SETTINGS_FILE,
+    "teams.json", "team_weekly_sets.json", "team_period_stats.json",
 ]
 for _fn in _STATE_FILES:
     try:
@@ -1237,6 +1238,11 @@ async def ingest_delivery_status(request: Request):
     _write_json(DELIVERY_STATUS_STORE, {"ts": time.time(), "data": data})
     _delivery_status_cache["ts"] = 0.0
     _delivery_status_cache["data"] = None
+    # 팀 구간별 집계: 오늘 누적값의 증분을 현재 구간에 저장합니다.
+    try:
+        capture_team_snapshot(data)
+    except Exception as e:
+        print("TEAM SNAPSHOT INGEST ERROR:", e)
     return {"ok": True}
 
 
@@ -1609,6 +1615,7 @@ def check(
         prev_completed_raw = int(cmap_prev.get(api_key, 0))
 
     login_key = f"{name_in}|{rider_login4}"
+    request.session["rider_login_key"] = login_key
     rolled_bonus, prevplus_after, rolled = attendance_rollover_if_needed(login_key, cur_start, cur_end_incl)
 
     prev_plus = get_prevplus(login_key)
@@ -2280,8 +2287,9 @@ def check(
         </div>
       </div>
 
-      <div style="margin-top:14px;">
-        <a href="/" style="text-decoration:none; color:#111;">← 다시 조회</a>
+      <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
+        <a href="/team" style="text-decoration:none; color:#fff; background:#111; padding:10px 14px; border-radius:10px; font-weight:900;">내 팀 페이지</a>
+        <a href="/" style="text-decoration:none; color:#111; padding:10px 0;">← 다시 조회</a>
       </div>
     </div>
     """
@@ -3000,7 +3008,9 @@ def dashboard(request: Request, q: str = ""):
             <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 룰렛 지급CSV</a>
             <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">룰렛 JSON</a>
             <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
-            <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
+            <a href="/admin/teams" style="text-decoration:none; color:#111; font-weight:900;">팀 구성 관리</a>
+        <a href="/admin/team-sets" style="text-decoration:none; color:#111; font-weight:900;">팀 세트 관리</a>
+        <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
         </div>
       </div>
 
@@ -4756,3 +4766,514 @@ try:
     app.add_api_route("/admin/backup/import", _final_admin_backup_import, methods=["POST"], name="Final Admin Backup Import")
 except Exception as _e:
     print("FINAL BACKUP ROUTE OVERRIDE ERROR:", _e)
+
+# ====================================================================================
+# Team management module (Rider Welfare)
+# - Admin creates teams by selecting one leader and multiple riders.
+# - Leader sees member-level complete/reject/cancel details.
+# - Members see only team aggregate quota/complete/reject/cancel.
+# - Weekly cycle: Wednesday 06:00 ~ next Wednesday 05:59.
+# - Period statistics are accumulated from delivery-status snapshot deltas.
+# ====================================================================================
+TEAM_FILE = str(STORE_DIR / "teams.json")
+TEAM_WEEKLY_SET_FILE = str(STORE_DIR / "team_weekly_sets.json")
+TEAM_PERIOD_STATS_FILE = str(STORE_DIR / "team_period_stats.json")
+_team_lock = threading.RLock()
+
+TEAM_SET_QUOTA = {
+    0: (21, 20, 30, 29),  # Monday
+    1: (21, 20, 30, 29),  # Tuesday
+    2: (21, 20, 30, 29),  # Wednesday
+    3: (21, 20, 30, 29),  # Thursday
+    4: (24, 21, 32, 33),  # Friday
+    5: (31, 22, 36, 31),  # Saturday
+    6: (33, 22, 35, 30),  # Sunday
+}
+TEAM_PERIODS = ("morning_lunch", "afternoon_offpeak", "dinner_peak", "late_night")
+TEAM_PERIOD_LABELS = {
+    "morning_lunch": "아침·점심피크",
+    "afternoon_offpeak": "오후 논피크",
+    "dinner_peak": "저녁피크",
+    "late_night": "심야",
+}
+
+
+def _team_load(path: str, default: Any) -> Any:
+    with _team_lock:
+        try:
+            p = Path(path)
+            if not p.exists():
+                return default
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data
+        except Exception:
+            return default
+
+
+def _team_save(path: str, data: Any) -> None:
+    with _team_lock:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
+
+
+def load_teams() -> List[Dict[str, Any]]:
+    data = _team_load(TEAM_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_teams(data: List[Dict[str, Any]]) -> None:
+    _team_save(TEAM_FILE, data)
+
+
+def load_team_weekly_sets() -> Dict[str, Any]:
+    data = _team_load(TEAM_WEEKLY_SET_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_team_weekly_sets(data: Dict[str, Any]) -> None:
+    _team_save(TEAM_WEEKLY_SET_FILE, data)
+
+
+def load_team_period_stats() -> Dict[str, Any]:
+    data = _team_load(TEAM_PERIOD_STATS_FILE, {"snapshots": {}, "stats": {}})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("snapshots", {})
+    data.setdefault("stats", {})
+    return data
+
+
+def save_team_period_stats(data: Dict[str, Any]) -> None:
+    _team_save(TEAM_PERIOD_STATS_FILE, data)
+
+
+def current_team_week_start(op_day: date | None = None) -> date:
+    d = op_day or operation_date()
+    # weekday: Monday=0, Wednesday=2
+    return d - timedelta(days=(d.weekday() - 2) % 7)
+
+
+def next_team_week_start(op_day: date | None = None) -> date:
+    return current_team_week_start(op_day) + timedelta(days=7)
+
+
+def team_period_for_datetime(now: datetime | None = None) -> str:
+    now = now or now_kst()
+    op_day = operation_date(now)
+    hour = now.hour
+    if hour >= 20 or hour < 6:
+        return "late_night"
+    if op_day.weekday() in (5, 6):
+        if hour < 14:
+            return "morning_lunch"
+        if hour < 17:
+            return "afternoon_offpeak"
+        return "dinner_peak"
+    if hour < 13:
+        return "morning_lunch"
+    if hour < 17:
+        return "afternoon_offpeak"
+    return "dinner_peak"
+
+
+def team_period_time_text(op_day: date, period: str) -> str:
+    weekend = op_day.weekday() in (5, 6)
+    if period == "morning_lunch":
+        return "06:00~14:00" if weekend else "06:00~13:00"
+    if period == "afternoon_offpeak":
+        return "14:00~17:00" if weekend else "13:00~17:00"
+    if period == "dinner_peak":
+        return "17:00~20:00"
+    return "20:00~다음 날 06:00"
+
+
+def team_quota(op_day: date, set_count: int) -> Dict[str, int]:
+    base = TEAM_SET_QUOTA.get(op_day.weekday(), (0, 0, 0, 0))
+    sets = max(0, int(set_count or 0))
+    return {p: int(base[i]) * sets for i, p in enumerate(TEAM_PERIODS)}
+
+
+def rider_directory() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for rr in fetch_riders_cached():
+        name = rr.get("name") or ""
+        login4, real4, _ = get_login4_for_rider(rr)
+        if not name or not login4:
+            continue
+        key = f"{norm_name(name)}|{login4}"
+        out[key] = {
+            "key": key,
+            "name": name,
+            "login4": login4,
+            "real4": real4,
+            "phone": rr.get("phoneNumber") or "",
+            "rider": rr,
+        }
+    return out
+
+
+def find_team_by_member(login_key: str) -> Optional[Dict[str, Any]]:
+    for team in load_teams():
+        if not team.get("active", True):
+            continue
+        if login_key == team.get("leader_key") or login_key in (team.get("member_keys") or []):
+            return team
+    return None
+
+
+def is_team_leader(team: Dict[str, Any], login_key: str) -> bool:
+    return bool(team and team.get("leader_key") == login_key)
+
+
+def team_week_record(team_id: str, week_start: date | None = None) -> Dict[str, Any]:
+    ws = week_start or current_team_week_start()
+    key = f"{team_id}|{ws.isoformat()}"
+    rec = load_team_weekly_sets().get(key) or {}
+    if not isinstance(rec, dict):
+        rec = {}
+    return rec
+
+
+def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
+    """Persist deltas of today's cumulative counters into the current operating period.
+
+    This works with the existing collector payload, which contains cumulative daily totals.
+    Calling this on every /ingest/delivery-status upload splits those totals by period.
+    """
+    try:
+        ds = delivery_data if isinstance(delivery_data, dict) else fetch_delivery_status_cached()
+        today_map = build_today_stats_map(ds)
+        directory = rider_directory()
+        now = now_kst()
+        op_day = operation_date(now)
+        period = team_period_for_datetime(now)
+        payload = load_team_period_stats()
+        snapshots = payload.setdefault("snapshots", {})
+        stats = payload.setdefault("stats", {})
+
+        for login_key, info in directory.items():
+            api_key = f"{norm_name(info['name'])}|{info['real4']}"
+            cur = today_map.get(api_key) or {}
+            current = {
+                "complete": int(cur.get("complete") or 0),
+                "reject": int(cur.get("reject") or 0),
+                "cancel": int(cur.get("cancel") or 0),
+            }
+            snap_key = f"{op_day.isoformat()}|{login_key}"
+            prev = snapshots.get(snap_key) or {"complete": 0, "reject": 0, "cancel": 0}
+            deltas = {}
+            for field in ("complete", "reject", "cancel"):
+                old = int(prev.get(field) or 0)
+                new = int(current[field])
+                # Collector/day reset protection: on reset, use current value as new delta.
+                deltas[field] = new - old if new >= old else new
+
+            stat_key = f"{op_day.isoformat()}|{period}|{login_key}"
+            row = stats.get(stat_key) or {"complete": 0, "reject": 0, "cancel": 0}
+            for field in ("complete", "reject", "cancel"):
+                row[field] = int(row.get(field) or 0) + max(0, int(deltas[field]))
+            row["updated_at"] = now.isoformat()
+            stats[stat_key] = row
+            snapshots[snap_key] = {**current, "updated_at": now.isoformat(), "period": period}
+
+        # Keep a practical history window.
+        cutoff = op_day - timedelta(days=120)
+        payload["stats"] = {
+            k: v for k, v in stats.items()
+            if safe_date_parse(k.split("|", 1)[0]) is None or safe_date_parse(k.split("|", 1)[0]) >= cutoff
+        }
+        payload["snapshots"] = {
+            k: v for k, v in snapshots.items()
+            if safe_date_parse(k.split("|", 1)[0]) is None or safe_date_parse(k.split("|", 1)[0]) >= cutoff
+        }
+        save_team_period_stats(payload)
+    except Exception as e:
+        print("TEAM SNAPSHOT ERROR:", e)
+
+
+def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, int]]:
+    payload = load_team_period_stats()
+    all_stats = payload.get("stats") or {}
+    out = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
+    for period in TEAM_PERIODS:
+        row = all_stats.get(f"{op_day.isoformat()}|{period}|{login_key}") or {}
+        out[period] = {
+            "complete": int(row.get("complete") or 0),
+            "reject": int(row.get("reject") or 0),
+            "cancel": int(row.get("cancel") or 0),
+        }
+    return out
+
+
+def team_all_keys(team: Dict[str, Any]) -> List[str]:
+    keys = [str(team.get("leader_key") or "")]
+    keys.extend([str(x) for x in (team.get("member_keys") or [])])
+    return list(dict.fromkeys([x for x in keys if x]))
+
+
+def aggregate_team_day(team: Dict[str, Any], op_day: date) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, Dict[str, int]]]]:
+    period_total = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
+    member_rows: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for key in team_all_keys(team):
+        member_stats = team_member_day_stats(key, op_day)
+        member_rows[key] = member_stats
+        for p in TEAM_PERIODS:
+            for f in ("complete", "reject", "cancel"):
+                period_total[p][f] += int(member_stats[p][f])
+    return period_total, member_rows
+
+
+def _team_escape(s: Any) -> str:
+    import html
+    return html.escape(str(s or ""), quote=True)
+
+
+def _team_nav(admin: bool = False) -> str:
+    if admin:
+        return "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;'><a href='/dashboard'>전체현황</a><a href='/admin/teams'><b>팀 구성 관리</b></a><a href='/admin/team-sets'>팀 세트 관리</a><a href='/admin-logout'>로그아웃</a></div>"
+    return "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;'><a href='/'>등급조회</a><a href='/team'><b>팀 페이지</b></a><a href='/team-logout'>팀 로그아웃</a></div>"
+
+
+@app.get("/admin/teams", response_class=HTMLResponse)
+def admin_teams_page(request: Request, edit_id: str = ""):
+    r = require_admin(request)
+    if r:
+        return r
+    directory = rider_directory()
+    teams = load_teams()
+    assigned = {}
+    for t in teams:
+        if not t.get("active", True):
+            continue
+        for k in team_all_keys(t):
+            assigned[k] = t.get("name") or "-"
+
+    edit_team = next((t for t in teams if str(t.get("id")) == str(edit_id)), None)
+    leader_selected = str((edit_team or {}).get("leader_key") or "")
+    member_selected = set((edit_team or {}).get("member_keys") or [])
+    options = []
+    checks = []
+    for key, info in sorted(directory.items(), key=lambda x: x[1]["name"]):
+        team_name = assigned.get(key, "소속 없음")
+        disabled = bool(key in assigned and (not edit_team or key not in team_all_keys(edit_team)))
+        dis = " disabled" if disabled else ""
+        sel = " selected" if key == leader_selected else ""
+        chk = " checked" if key in member_selected else ""
+        muted = "color:#aaa;" if disabled else ""
+        options.append(f"<option value='{_team_escape(key)}'{sel}{dis}>{_team_escape(info['name'])} · {info['login4']} · {team_name}</option>")
+        checks.append(f"<label style='display:flex;align-items:center;gap:8px;padding:9px;border-bottom:1px solid #eee;{muted}'><input type='checkbox' name='member_keys' value='{_team_escape(key)}'{chk}{dis}> <b>{_team_escape(info['name'])}</b><span style='color:#777'>{info['login4']} · {team_name}</span></label>")
+
+    team_cards = ""
+    for t in teams:
+        leader = directory.get(str(t.get("leader_key") or ""), {})
+        members = [directory.get(k, {}).get("name", k) for k in (t.get("member_keys") or [])]
+        team_cards += f"""
+        <div style='border:1px solid #e5e5e5;border-radius:14px;padding:14px;background:#fff;margin-bottom:10px;'>
+          <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;'><div><b style='font-size:18px'>{_team_escape(t.get('name'))}</b><div style='color:#666;margin-top:5px'>팀장 {_team_escape(leader.get('name','-'))} · 총 {1+len(members)}명</div></div><a href='/admin/teams?edit_id={_team_escape(t.get('id'))}'>수정</a></div>
+          <div style='margin-top:8px;color:#555'>팀원: {_team_escape(', '.join(members) if members else '없음')}</div>
+          <form method='post' action='/admin/team-delete' style='margin-top:10px' onsubmit="return confirm('팀을 해체하시겠습니까?')"><input type='hidden' name='team_id' value='{_team_escape(t.get('id'))}'><button style='border:1px solid #ddd;background:#fff;border-radius:8px;padding:7px 10px'>팀 해체</button></form>
+        </div>"""
+
+    body = f"""
+    {_team_nav(True)}
+    <div style='display:grid;grid-template-columns:minmax(320px,1fr) minmax(360px,1.3fr);gap:16px;align-items:start'>
+      <div><h2 style='margin-top:0'>팀 구성 관리</h2>{team_cards or '<div>생성된 팀이 없습니다.</div>'}</div>
+      <div style='background:#fff;border:1px solid #e5e5e5;border-radius:16px;padding:16px'>
+        <h2 style='margin-top:0'>{'팀 수정' if edit_team else '새 팀 만들기'}</h2>
+        <form method='post' action='/admin/team-save'>
+          <input type='hidden' name='team_id' value='{_team_escape((edit_team or {}).get('id',''))}'>
+          <label>팀명</label><input name='team_name' value='{_team_escape((edit_team or {}).get('name',''))}' required style='width:100%;box-sizing:border-box;padding:11px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px'>
+          <label>팀장 선택</label><select name='leader_key' required style='width:100%;padding:11px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px'><option value=''>팀장 선택</option>{''.join(options)}</select>
+          <div style='font-weight:700;margin-bottom:6px'>팀원 선택</div><div style='max-height:420px;overflow:auto;border:1px solid #ddd;border-radius:10px'>{''.join(checks)}</div>
+          <button style='width:100%;margin-top:14px;padding:12px;border:none;border-radius:10px;background:#111;color:#fff;font-weight:800'>{'팀 수정 저장' if edit_team else '팀 생성'}</button>
+        </form>
+      </div>
+    </div>"""
+    return HTMLResponse(html_page("팀 구성 관리", body))
+
+
+@app.post("/admin/team-save")
+async def admin_team_save(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+    form = await request.form()
+    team_id = str(form.get("team_id") or "").strip()
+    team_name = str(form.get("team_name") or "").strip()
+    leader_key = str(form.get("leader_key") or "").strip()
+    member_keys = [str(x) for x in form.getlist("member_keys") if str(x)]
+    member_keys = [x for x in dict.fromkeys(member_keys) if x != leader_key]
+    directory = rider_directory()
+    if not team_name or leader_key not in directory:
+        return RedirectResponse("/admin/teams", status_code=303)
+
+    teams = load_teams()
+    # Do not allow a rider to belong to multiple active teams.
+    selected = set([leader_key] + member_keys)
+    for t in teams:
+        if team_id and str(t.get("id")) == team_id:
+            continue
+        if t.get("active", True) and selected.intersection(team_all_keys(t)):
+            return HTMLResponse(html_page("팀 저장 실패", "<div style='max-width:600px;margin:40px auto;background:#fff;padding:20px;border-radius:14px'><h3>이미 다른 팀에 소속된 기사가 포함되어 있습니다.</h3><a href='/admin/teams'>돌아가기</a></div>"), status_code=400)
+
+    now_text = now_kst().isoformat()
+    if team_id:
+        target = next((t for t in teams if str(t.get("id")) == team_id), None)
+        if target:
+            target.update({"name": team_name, "leader_key": leader_key, "member_keys": member_keys, "active": True, "updated_at": now_text})
+    else:
+        next_id = str(max([int(t.get("id") or 0) for t in teams] + [0]) + 1)
+        teams.append({"id": next_id, "name": team_name, "leader_key": leader_key, "member_keys": member_keys, "active": True, "created_at": now_text, "updated_at": now_text})
+    save_teams(teams)
+    return RedirectResponse("/admin/teams", status_code=303)
+
+
+@app.post("/admin/team-delete")
+def admin_team_delete(request: Request, team_id: str = Form(...)):
+    r = require_admin(request)
+    if r:
+        return r
+    teams = load_teams()
+    teams = [t for t in teams if str(t.get("id")) != str(team_id)]
+    save_teams(teams)
+    return RedirectResponse("/admin/teams", status_code=303)
+
+
+@app.get("/admin/team-sets", response_class=HTMLResponse)
+def admin_team_sets_page(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+    directory = rider_directory()
+    sets = load_team_weekly_sets()
+    ws = current_team_week_start()
+    nws = next_team_week_start()
+    rows = ""
+    for t in load_teams():
+        leader_name = directory.get(str(t.get("leader_key") or ""), {}).get("name", "-")
+        for week in (ws, nws):
+            key = f"{t.get('id')}|{week.isoformat()}"
+            rec = sets.get(key) or {}
+            rows += f"<tr><td>{_team_escape(t.get('name'))}</td><td>{_team_escape(leader_name)}</td><td>{week}~{week+timedelta(days=6)}</td><td>{int(rec.get('set_count') or 0)}</td><td>{_team_escape(rec.get('status') or '미신청')}</td><td><form method='post' action='/admin/team-set-save' style='display:flex;gap:6px'><input type='hidden' name='team_id' value='{_team_escape(t.get('id'))}'><input type='hidden' name='week_start' value='{week}'><input name='set_count' type='number' min='0' max='20' value='{int(rec.get('set_count') or 0)}' style='width:64px'><select name='status'><option value='approved'>승인</option><option value='pending'>대기</option><option value='rejected'>반려</option></select><button>저장</button></form></td></tr>"
+    body = f"{_team_nav(True)}<h2>팀 세트 관리</h2><div style='overflow:auto;background:#fff;border:1px solid #ddd;border-radius:14px'><table style='width:100%;border-collapse:collapse'><thead><tr><th>팀</th><th>팀장</th><th>적용 주차</th><th>세트</th><th>상태</th><th>관리자 변경</th></tr></thead><tbody>{rows}</tbody></table></div><style>th,td{{padding:10px;border-bottom:1px solid #eee;text-align:center;white-space:nowrap}}</style>"
+    return HTMLResponse(html_page("팀 세트 관리", body))
+
+
+@app.post("/admin/team-set-save")
+def admin_team_set_save(request: Request, team_id: str = Form(...), week_start: str = Form(...), set_count: int = Form(...), status: str = Form("approved")):
+    r = require_admin(request)
+    if r:
+        return r
+    ws = safe_date_parse(week_start)
+    if not ws:
+        return RedirectResponse("/admin/team-sets", status_code=303)
+    data = load_team_weekly_sets()
+    key = f"{team_id}|{ws.isoformat()}"
+    old = data.get(key) or {}
+    old.update({"team_id": team_id, "week_start": ws.isoformat(), "week_end": (ws+timedelta(days=6)).isoformat(), "set_count": max(0, int(set_count)), "status": status, "approved_at": now_kst().isoformat(), "approved_by": "admin"})
+    data[key] = old
+    save_team_weekly_sets(data)
+    return RedirectResponse("/admin/team-sets", status_code=303)
+
+
+@app.get("/team-login", response_class=HTMLResponse)
+def team_login_page():
+    body = """<div style='max-width:430px;margin:70px auto;background:#fff;border:1px solid #ddd;border-radius:16px;padding:20px'><h2>팀 페이지 로그인</h2><form method='post' action='/team-login'><input name='name' placeholder='이름' required style='width:100%;box-sizing:border-box;padding:12px;margin-bottom:10px'><input name='login4' pattern='\\d{4}' maxlength='4' placeholder='로그인용 뒷 4자리' required style='width:100%;box-sizing:border-box;padding:12px;margin-bottom:10px'><button style='width:100%;padding:12px;background:#111;color:#fff;border:none;border-radius:10px'>로그인</button></form><div style='margin-top:12px'><a href='/'>등급조회로</a></div></div>"""
+    return HTMLResponse(html_page("팀 로그인", body))
+
+
+@app.post("/team-login")
+def team_login_action(request: Request, name: str = Form(...), login4: str = Form(...)):
+    rider = find_rider_by_name_login4(name, login4)
+    if not rider:
+        return HTMLResponse(html_page("로그인 실패", "<div style='max-width:500px;margin:50px auto;background:#fff;padding:20px'><h3>기사 정보를 찾을 수 없습니다.</h3><a href='/team-login'>다시 로그인</a></div>"), status_code=400)
+    key = f"{norm_name(rider.get('name') or '')}|{login4}"
+    request.session["rider_login_key"] = key
+    return RedirectResponse("/team", status_code=303)
+
+
+@app.get("/team-logout")
+def team_logout(request: Request):
+    request.session.pop("rider_login_key", None)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/team/set-request")
+def team_set_request(request: Request, week_start: str = Form(...), set_count: int = Form(...)):
+    key = str(request.session.get("rider_login_key") or "")
+    team = find_team_by_member(key)
+    if not team or not is_team_leader(team, key):
+        return RedirectResponse("/team-login", status_code=303)
+    ws = safe_date_parse(week_start)
+    if ws != next_team_week_start():
+        return RedirectResponse("/team", status_code=303)
+    data = load_team_weekly_sets()
+    record_key = f"{team.get('id')}|{ws.isoformat()}"
+    data[record_key] = {"team_id": str(team.get("id")), "week_start": ws.isoformat(), "week_end": (ws+timedelta(days=6)).isoformat(), "set_count": max(0, min(20, int(set_count))), "member_count": len(team_all_keys(team)), "status": "pending", "requested_by": key, "requested_at": now_kst().isoformat()}
+    save_team_weekly_sets(data)
+    return RedirectResponse("/team", status_code=303)
+
+
+@app.get("/team", response_class=HTMLResponse)
+def team_page(request: Request, day: str = ""):
+    login_key = str(request.session.get("rider_login_key") or "")
+    if not login_key:
+        return RedirectResponse("/team-login", status_code=303)
+    team = find_team_by_member(login_key)
+    if not team:
+        return HTMLResponse(html_page("팀 페이지", f"{_team_nav(False)}<div style='background:#fff;padding:20px;border-radius:14px'><h3>소속된 팀이 없습니다.</h3></div>"))
+    capture_team_snapshot()
+    directory = rider_directory()
+    op_day = safe_date_parse(day) or operation_date()
+    ws = current_team_week_start(op_day)
+    rec = team_week_record(str(team.get("id")), ws)
+    set_count = int(rec.get("set_count") or 0) if rec.get("status") in ("approved", "pending") else 0
+    quota = team_quota(op_day, set_count)
+    totals, member_rows = aggregate_team_day(team, op_day)
+    leader_mode = is_team_leader(team, login_key)
+    leader_name = directory.get(str(team.get("leader_key") or ""), {}).get("name", "-")
+    period_rows = ""
+    day_complete = day_reject = day_cancel = day_quota = 0
+    for p in TEAM_PERIODS:
+        q = quota[p]; c = totals[p]["complete"]; rj = totals[p]["reject"]; ca = totals[p]["cancel"]
+        day_complete += c; day_reject += rj; day_cancel += ca; day_quota += q
+        rate = round(c/q*100, 1) if q else 0
+        period_rows += f"<tr><td>{TEAM_PERIOD_LABELS[p]}</td><td>{team_period_time_text(op_day,p)}</td><td>{c}/{q}</td><td>{rj}</td><td>{ca}</td><td>{rate}%</td></tr>"
+
+    member_table = ""
+    if leader_mode:
+        mrows = ""
+        for k in team_all_keys(team):
+            info = directory.get(k, {"name": k})
+            parts = member_rows.get(k) or {}
+            complete = sum(int((parts.get(p) or {}).get("complete") or 0) for p in TEAM_PERIODS)
+            reject = sum(int((parts.get(p) or {}).get("reject") or 0) for p in TEAM_PERIODS)
+            cancel = sum(int((parts.get(p) or {}).get("cancel") or 0) for p in TEAM_PERIODS)
+            details = "<br>".join(f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}" for p in TEAM_PERIODS)
+            ratio = round((reject+cancel)/complete*100,1) if complete else 0
+            role = "팀장" if k == team.get("leader_key") else "팀원"
+            mrows += f"<tr><td>{_team_escape(info.get('name'))}<div style='font-size:12px;color:#777'>{role}</div></td><td>{complete}</td><td>{reject}</td><td>{cancel}</td><td>{ratio}%</td><td style='text-align:left;font-size:12px;line-height:1.6'>{details}</td></tr>"
+        member_table = f"<h3>팀원별 세부 운행기록</h3><div style='overflow:auto;background:#fff;border:1px solid #ddd;border-radius:14px'><table style='width:100%;border-collapse:collapse'><thead><tr><th>이름</th><th>완료</th><th>거절</th><th>취소</th><th>거절+취소율</th><th>구간별 상세</th></tr></thead><tbody>{mrows}</tbody></table></div>"
+
+    set_form = ""
+    if leader_mode:
+        nws = next_team_week_start()
+        next_rec = team_week_record(str(team.get("id")), nws)
+        set_form = f"""<div style='margin-top:16px;background:#fff;border:1px solid #ddd;border-radius:14px;padding:14px'><h3 style='margin-top:0'>다음 주 세트 신청</h3><div>{nws}~{nws+timedelta(days=6)} · 현재 {len(team_all_keys(team))}명 · 신청상태 {_team_escape(next_rec.get('status') or '미신청')}</div><form method='post' action='/team/set-request' style='display:flex;gap:8px;margin-top:10px'><input type='hidden' name='week_start' value='{nws}'><input type='number' name='set_count' min='0' max='20' value='{int(next_rec.get('set_count') or 1)}' style='width:90px;padding:9px'><button style='padding:9px 14px;background:#111;color:#fff;border:none;border-radius:9px'>신청/수정</button></form></div>"""
+
+    prev_day = op_day - timedelta(days=1); next_day = min(operation_date(), op_day + timedelta(days=1))
+    body = f"""
+    {_team_nav(False)}
+    <div style='background:#fff;border:1px solid #ddd;border-radius:16px;padding:16px'>
+      <h2 style='margin:0'>{_team_escape(team.get('name'))}</h2><div style='color:#666;margin-top:6px'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
+      <div style='display:flex;justify-content:space-between;margin-top:14px'><a href='/team?day={prev_day}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}'>다음날 →</a></div>
+      <div style='display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:14px'><div class='team-card'>신청 세트<b>{set_count}세트</b></div><div class='team-card'>완료<b>{day_complete}/{day_quota}</b></div><div class='team-card'>거절<b>{day_reject}</b></div><div class='team-card'>취소<b>{day_cancel}</b></div></div>
+    </div>
+    <h3>팀 전체 구간 현황</h3><div style='overflow:auto;background:#fff;border:1px solid #ddd;border-radius:14px'><table style='width:100%;border-collapse:collapse'><thead><tr><th>구간</th><th>시간</th><th>완료/할당량</th><th>거절</th><th>취소</th><th>달성률</th></tr></thead><tbody>{period_rows}</tbody></table></div>
+    {member_table}{set_form}
+    <style>.team-card{{padding:12px;border:1px solid #eee;border-radius:12px;color:#777}}.team-card b{{display:block;font-size:22px;color:#111;margin-top:5px}}th,td{{padding:10px;border-bottom:1px solid #eee;text-align:center;white-space:nowrap}}@media(max-width:700px){{.team-card{{min-width:0}}}}</style>
+    """
+    return HTMLResponse(html_page("팀 페이지", body))
