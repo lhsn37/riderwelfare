@@ -846,7 +846,9 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
         return cached["data"]
 
     all_status = _read_json(STATUS_STORE, {})
-    m = all_status.get(key) or {}
+    raw = all_status.get(key) or {}
+    # 신형: {completeMap, historyMap}; 구형: completeMap 자체
+    m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
     out: Dict[str, int] = {}
     if isinstance(m, dict):
         for k, v in m.items():
@@ -857,6 +859,16 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
 
     _status_cache[key] = {"ts": now, "data": out}
     return out
+
+
+def fetch_status_history_map(from_d: date, to_d: date) -> Dict[str, Dict[str, Any]]:
+    key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+    all_status = _read_json(STATUS_STORE, {}) or {}
+    raw = all_status.get(key) or {}
+    if not isinstance(raw, dict):
+        return {}
+    hm = raw.get("historyMap") or {}
+    return hm if isinstance(hm, dict) else {}
 
 
 def has_status_range(from_d: date, to_d: date) -> bool:
@@ -1342,17 +1354,29 @@ async def ingest_status(request: Request):
     from_d = payload.get("fromDate")
     to_d = payload.get("toDate")
     complete_map = payload.get("completeMap")
+    history_map = payload.get("historyMap") or {}
 
     if not (isinstance(from_d, str) and isinstance(to_d, str) and isinstance(complete_map, dict)):
         return JSONResponse({"ok": False, "error": "INVALID_PAYLOAD"}, status_code=400)
+    if not isinstance(history_map, dict):
+        history_map = {}
 
     all_status = _read_json(STATUS_STORE, {})
     key = f"{from_d}_{to_d}"
-    all_status[key] = complete_map
+    all_status[key] = {
+        "completeMap": complete_map,
+        "historyMap": history_map,
+        "updated_at": now_kst().isoformat(),
+    }
     _write_json(STATUS_STORE, all_status)
 
     _status_cache.pop(key, None)
-    return {"ok": True, "key": key, "count": len(complete_map)}
+    return {
+        "ok": True,
+        "key": key,
+        "count": len(complete_map),
+        "history_count": len(history_map),
+    }
 
 
 # -----------------------------
@@ -5060,9 +5084,35 @@ def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
 
 
 def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, int]]:
+    out = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
+
+    # 과거 날짜는 collector가 rider-delivery-status로 가져온 개인 기록을 우선 사용합니다.
+    if op_day < operation_date():
+        directory = rider_directory()
+        info = directory.get(login_key) or {}
+        name = info.get("name") or ""
+        real4 = info.get("real4") or ""
+        api_key = f"{norm_name(name)}|{real4}" if name and real4 else ""
+        history = fetch_status_history_map(op_day, op_day)
+        rec = history.get(api_key) if api_key else None
+        if isinstance(rec, dict):
+            peak = rec.get("peak") or {}
+            out["morning_lunch"]["complete"] = int(peak.get("morning") or 0)
+            out["afternoon_offpeak"]["complete"] = int(peak.get("afternoon") or 0)
+            out["dinner_peak"]["complete"] = int(peak.get("evening") or 0)
+            out["late_night"]["complete"] = int(peak.get("midnight") or 0)
+            out["_meta"] = {  # type: ignore[assignment]
+                "historical_api": 1,
+                "daily_reject": int(rec.get("reject") or 0),
+                "daily_cancel": int(rec.get("cancel") or 0),
+                "daily_complete": int(rec.get("complete") or 0),
+                "hourlyCompleted": rec.get("hourlyCompleted") or [],
+            }
+            return out
+
+    # 오늘 또는 구형 저장자료는 기존 팀 스냅샷을 사용합니다.
     payload = load_team_period_stats()
     all_stats = payload.get("stats") or {}
-    out = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
     has_period_data = False
     for period in TEAM_PERIODS:
         row = all_stats.get(f"{op_day.isoformat()}|{period}|{login_key}") or {}
@@ -5074,8 +5124,7 @@ def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, i
             "cancel": int(row.get("cancel") or 0),
         }
 
-    # 과거 스냅샷이 없으면 collector가 크롤링한 해당 날짜의 개인 완료건수를 사용합니다.
-    # 과거 API는 일일 합계만 주므로 첫 칸을 '일일 전체' 용도로 사용하고 구간별 값으로 위장하지 않습니다.
+    # 구형 completeMap만 남아 있는 과거 자료에 대한 호환 처리
     if not has_period_data and op_day < operation_date():
         directory = rider_directory()
         info = directory.get(login_key) or {}
@@ -5102,12 +5151,18 @@ def aggregate_team_day(team: Dict[str, Any], op_day: date) -> Tuple[Dict[str, Di
     historical_daily = False
     for key in team_all_keys(team):
         member_stats = team_member_day_stats(key, op_day)
-        if isinstance(member_stats.get("_meta"), dict) and member_stats.get("_meta", {}).get("historical_daily"):
+        meta = member_stats.get("_meta") if isinstance(member_stats.get("_meta"), dict) else {}
+        if meta.get("historical_daily"):
             historical_daily = True
         member_rows[key] = member_stats
         for p in TEAM_PERIODS:
             for f in ("complete", "reject", "cancel"):
                 period_total[p][f] += int(member_stats[p][f])
+        # 과거 API는 거절/취소를 구간별로 주지 않으므로 일일 합계를 첫 구간에만 담아
+        # 팀/개인 하루 합계 계산에는 포함시키고 구간 표시는 별도로 처리합니다.
+        if meta.get("historical_api"):
+            period_total["morning_lunch"]["reject"] += int(meta.get("daily_reject") or 0)
+            period_total["morning_lunch"]["cancel"] += int(meta.get("daily_cancel") or 0)
     return period_total, member_rows, historical_daily
 
 
@@ -5375,13 +5430,23 @@ def team_page(request: Request, day: str = ""):
             info = directory.get(k, {"name": k})
             parts = member_rows.get(k) or {}
             complete = sum(int((parts.get(p) or {}).get("complete") or 0) for p in TEAM_PERIODS)
-            reject = sum(int((parts.get(p) or {}).get("reject") or 0) for p in TEAM_PERIODS)
-            cancel = sum(int((parts.get(p) or {}).get("cancel") or 0) for p in TEAM_PERIODS)
+            meta = parts.get("_meta") if isinstance(parts.get("_meta"), dict) else {}
+            reject = int(meta.get("daily_reject") or 0) if meta.get("historical_api") else sum(int((parts.get(p) or {}).get("reject") or 0) for p in TEAM_PERIODS)
+            cancel = int(meta.get("daily_cancel") or 0) if meta.get("historical_api") else sum(int((parts.get(p) or {}).get("cancel") or 0) for p in TEAM_PERIODS)
             ratio = round((reject + cancel) / complete * 100, 1) if complete else 0
             role = "팀장" if k == team.get("leader_key") else "팀원"
             if historical_daily:
                 details = f"일일 전체 완료: {complete}건"
                 detail_cards = f"<div><span>일일 전체</span><b>{complete}</b><small>배민 과거 개인기록</small></div>"
+            elif meta.get("historical_api"):
+                details = "<br>".join(
+                    f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)}"
+                    for p in TEAM_PERIODS
+                )
+                detail_cards = "".join(
+                    f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>배민 과거 구간기록</small></div>"
+                    for p in TEAM_PERIODS
+                )
             else:
                 details = "<br>".join(
                     f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}"
