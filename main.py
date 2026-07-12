@@ -5222,9 +5222,11 @@ def team_page(request: Request, day: str = ""):
     login_key = str(request.session.get("rider_login_key") or "")
     if not login_key:
         return RedirectResponse("/team-login", status_code=303)
+
     team = find_team_by_member(login_key)
     if not team:
-        return HTMLResponse(html_page("팀 페이지", f"{_team_nav(False)}<div style='background:#fff;padding:20px;border-radius:14px'><h3>소속된 팀이 없습니다.</h3></div>"))
+        return HTMLResponse(html_page("팀 페이지", f"{_team_nav(False)}<div class='empty-card'><h3>소속된 팀이 없습니다.</h3></div>"))
+
     capture_team_snapshot()
     directory = rider_directory()
     op_day = safe_date_parse(day) or operation_date()
@@ -5235,45 +5237,181 @@ def team_page(request: Request, day: str = ""):
     totals, member_rows = aggregate_team_day(team, op_day)
     leader_mode = is_team_leader(team, login_key)
     leader_name = directory.get(str(team.get("leader_key") or ""), {}).get("name", "-")
+
     period_rows = ""
+    period_cards = ""
     day_complete = day_reject = day_cancel = day_quota = 0
     for p in TEAM_PERIODS:
-        q = quota[p]; c = totals[p]["complete"]; rj = totals[p]["reject"]; ca = totals[p]["cancel"]
-        day_complete += c; day_reject += rj; day_cancel += ca; day_quota += q
-        rate = round(c/q*100, 1) if q else 0
-        period_rows += f"<tr><td>{TEAM_PERIOD_LABELS[p]}</td><td>{team_period_time_text(op_day,p)}</td><td>{c}/{q}</td><td>{rj}</td><td>{ca}</td><td>{rate}%</td></tr>"
+        q = quota[p]
+        c = totals[p]["complete"]
+        rj = totals[p]["reject"]
+        ca = totals[p]["cancel"]
+        day_complete += c
+        day_reject += rj
+        day_cancel += ca
+        day_quota += q
+        rate = round(c / q * 100, 1) if q else 0
+        period_rows += f"<tr><td>{TEAM_PERIOD_LABELS[p]}</td><td>{team_period_time_text(op_day,p)}</td><td><b>{c}</b> / {q}</td><td>{rj}</td><td>{ca}</td><td>{rate}%</td></tr>"
+        period_cards += f"""
+        <div class='period-card'>
+          <div class='period-card-head'><b>{TEAM_PERIOD_LABELS[p]}</b><span>{team_period_time_text(op_day,p)}</span></div>
+          <div class='period-main'><strong>{c}</strong><span>/ {q}건</span><em>{rate}%</em></div>
+          <div class='period-sub'><span>거절 <b>{rj}</b></span><span>취소 <b>{ca}</b></span></div>
+        </div>"""
 
     member_table = ""
     if leader_mode:
         mrows = ""
+        member_cards = ""
         for k in team_all_keys(team):
             info = directory.get(k, {"name": k})
             parts = member_rows.get(k) or {}
             complete = sum(int((parts.get(p) or {}).get("complete") or 0) for p in TEAM_PERIODS)
             reject = sum(int((parts.get(p) or {}).get("reject") or 0) for p in TEAM_PERIODS)
             cancel = sum(int((parts.get(p) or {}).get("cancel") or 0) for p in TEAM_PERIODS)
-            details = "<br>".join(f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}" for p in TEAM_PERIODS)
-            ratio = round((reject+cancel)/complete*100,1) if complete else 0
+            ratio = round((reject + cancel) / complete * 100, 1) if complete else 0
             role = "팀장" if k == team.get("leader_key") else "팀원"
-            mrows += f"<tr><td>{_team_escape(info.get('name'))}<div style='font-size:12px;color:#777'>{role}</div></td><td>{complete}</td><td>{reject}</td><td>{cancel}</td><td>{ratio}%</td><td style='text-align:left;font-size:12px;line-height:1.6'>{details}</td></tr>"
-        member_table = f"<h3>팀원별 세부 운행기록</h3><div style='overflow:auto;background:#fff;border:1px solid #ddd;border-radius:14px'><table style='width:100%;border-collapse:collapse'><thead><tr><th>이름</th><th>완료</th><th>거절</th><th>취소</th><th>거절+취소율</th><th>구간별 상세</th></tr></thead><tbody>{mrows}</tbody></table></div>"
+            details = "<br>".join(
+                f"{TEAM_PERIOD_LABELS[p]}: 완료 {(parts.get(p) or {}).get('complete',0)} / 거절 {(parts.get(p) or {}).get('reject',0)} / 취소 {(parts.get(p) or {}).get('cancel',0)}"
+                for p in TEAM_PERIODS
+            )
+            detail_cards = "".join(
+                f"<div><span>{TEAM_PERIOD_LABELS[p]}</span><b>{(parts.get(p) or {}).get('complete',0)}</b><small>거절 {(parts.get(p) or {}).get('reject',0)} · 취소 {(parts.get(p) or {}).get('cancel',0)}</small></div>"
+                for p in TEAM_PERIODS
+            )
+            mrows += f"<tr><td>{_team_escape(info.get('name'))}<div class='role'>{role}</div></td><td>{complete}</td><td>{reject}</td><td>{cancel}</td><td>{ratio}%</td><td class='detail-cell'>{details}</td></tr>"
+            member_cards += f"""
+            <div class='member-card'>
+              <div class='member-head'><div><b>{_team_escape(info.get('name'))}</b><span>{role}</span></div><strong>{complete}건</strong></div>
+              <div class='member-summary'><span>거절 <b>{reject}</b></span><span>취소 <b>{cancel}</b></span><span>비율 <b>{ratio}%</b></span></div>
+              <details><summary>구간별 상세 보기</summary><div class='member-periods'>{detail_cards}</div></details>
+            </div>"""
+
+        member_table = f"""
+        <section class='section-block'>
+          <h3>팀원별 세부 운행기록</h3>
+          <div class='desktop-table'><table><thead><tr><th>이름</th><th>완료</th><th>거절</th><th>취소</th><th>거절+취소율</th><th>구간별 상세</th></tr></thead><tbody>{mrows}</tbody></table></div>
+          <div class='mobile-cards'>{member_cards}</div>
+        </section>"""
 
     set_form = ""
     if leader_mode:
         nws = next_team_week_start()
         next_rec = team_week_record(str(team.get("id")), nws)
-        set_form = f"""<div style='margin-top:16px;background:#fff;border:1px solid #ddd;border-radius:14px;padding:14px'><h3 style='margin-top:0'>다음 주 세트 신청</h3><div>{nws}~{nws+timedelta(days=6)} · 현재 {len(team_all_keys(team))}명 · 신청상태 {_team_escape(next_rec.get('status') or '미신청')}</div><form method='post' action='/team/set-request' style='display:flex;gap:8px;margin-top:10px'><input type='hidden' name='week_start' value='{nws}'><input type='number' name='set_count' min='0' max='20' value='{int(next_rec.get('set_count') or 1)}' style='width:90px;padding:9px'><button style='padding:9px 14px;background:#111;color:#fff;border:none;border-radius:9px'>신청/수정</button></form></div>"""
+        set_form = f"""
+        <section class='set-card'>
+          <h3>다음 주 세트 신청</h3>
+          <div class='set-meta'>{nws} ~ {nws + timedelta(days=6)}<br>현재 {len(team_all_keys(team))}명 · 신청상태 <b>{_team_escape(next_rec.get('status') or '미신청')}</b></div>
+          <form method='post' action='/team/set-request'>
+            <input type='hidden' name='week_start' value='{nws}'>
+            <input type='number' name='set_count' min='0' max='20' value='{int(next_rec.get('set_count') or 1)}'>
+            <button>신청/수정</button>
+          </form>
+        </section>"""
 
-    prev_day = op_day - timedelta(days=1); next_day = min(operation_date(), op_day + timedelta(days=1))
+    prev_day = op_day - timedelta(days=1)
+    next_day = min(operation_date(), op_day + timedelta(days=1))
+    progress = round(day_complete / day_quota * 100, 1) if day_quota else 0
+
     body = f"""
-    {_team_nav(False)}
-    <div style='background:#fff;border:1px solid #ddd;border-radius:16px;padding:16px'>
-      <h2 style='margin:0'>{_team_escape(team.get('name'))}</h2><div style='color:#666;margin-top:6px'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
-      <div style='display:flex;justify-content:space-between;margin-top:14px'><a href='/team?day={prev_day}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}'>다음날 →</a></div>
-      <div style='display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:14px'><div class='team-card'>신청 세트<b>{set_count}세트</b></div><div class='team-card'>완료<b>{day_complete}/{day_quota}</b></div><div class='team-card'>거절<b>{day_reject}</b></div><div class='team-card'>취소<b>{day_cancel}</b></div></div>
+    <style>
+      *{{box-sizing:border-box}}
+      body{{margin:0}}
+      .team-shell{{max-width:980px;margin:0 auto}}
+      .team-nav{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}}
+      .team-nav a{{text-decoration:none;padding:8px 11px;border-radius:9px;background:#f1f1f1;color:#222;font-size:14px}}
+      .hero{{background:#fff;border:1px solid #e3e3e3;border-radius:18px;padding:18px;box-shadow:0 3px 14px rgba(0,0,0,.03)}}
+      .hero h2{{margin:0;font-size:26px}}
+      .sub{{color:#666;margin-top:7px;font-size:14px}}
+      .date-nav{{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;margin-top:18px;gap:10px}}
+      .date-nav a{{text-decoration:none;color:#5b2a86;font-weight:800}}
+      .date-nav a:last-child{{text-align:right}}
+      .date-nav b{{font-size:18px}}
+      .summary-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}}
+      .team-card{{padding:14px;border:1px solid #ececec;border-radius:14px;color:#777;min-width:0;background:#fcfcfc}}
+      .team-card b{{display:block;font-size:24px;color:#111;margin-top:5px;white-space:nowrap}}
+      .progress-wrap{{margin-top:14px}}
+      .progress-label{{display:flex;justify-content:space-between;font-size:13px;color:#666;margin-bottom:6px}}
+      .progress-bar{{height:10px;background:#eee;border-radius:999px;overflow:hidden}}
+      .progress-bar i{{display:block;height:100%;width:{min(progress,100)}%;background:#111;border-radius:999px}}
+      .section-block{{margin-top:24px}}
+      .section-block h3,.set-card h3{{margin:0 0 12px;font-size:21px}}
+      .desktop-table{{overflow:auto;background:#fff;border:1px solid #e3e3e3;border-radius:15px}}
+      table{{width:100%;border-collapse:collapse}}
+      th,td{{padding:12px 10px;border-bottom:1px solid #eee;text-align:center;white-space:nowrap}}
+      th{{background:#fafafa;font-size:14px}}
+      .detail-cell{{text-align:left;font-size:12px;line-height:1.7}}
+      .role{{font-size:12px;color:#888;margin-top:4px}}
+      .mobile-cards{{display:none}}
+      .period-card,.member-card,.set-card{{background:#fff;border:1px solid #e3e3e3;border-radius:15px;padding:14px}}
+      .period-card-head,.member-head{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}}
+      .period-card-head span,.member-head span{{display:block;color:#777;font-size:12px;margin-top:3px}}
+      .period-main{{display:flex;align-items:baseline;gap:5px;margin-top:13px}}
+      .period-main strong{{font-size:30px}}
+      .period-main span{{color:#777}}
+      .period-main em{{margin-left:auto;font-style:normal;font-weight:900}}
+      .period-sub,.member-summary{{display:flex;gap:10px;margin-top:12px}}
+      .period-sub span,.member-summary span{{flex:1;background:#f7f7f7;padding:9px;border-radius:9px;text-align:center;font-size:13px}}
+      .member-head strong{{font-size:22px}}
+      details{{margin-top:12px}}
+      summary{{cursor:pointer;font-weight:800;color:#5b2a86}}
+      .member-periods{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}}
+      .member-periods div{{background:#f8f8f8;padding:10px;border-radius:10px}}
+      .member-periods span,.member-periods small{{display:block;color:#777;font-size:11px}}
+      .member-periods b{{display:block;font-size:19px;margin:3px 0}}
+      .set-card{{margin-top:20px}}
+      .set-meta{{color:#666;line-height:1.6}}
+      .set-card form{{display:flex;gap:8px;margin-top:12px}}
+      .set-card input{{width:90px;padding:11px;border:1px solid #ddd;border-radius:10px;font-size:16px}}
+      .set-card button{{flex:1;padding:11px 14px;background:#111;color:#fff;border:none;border-radius:10px;font-weight:900}}
+      .empty-card{{max-width:600px;margin:40px auto;background:#fff;padding:20px;border-radius:14px}}
+      @media(max-width:700px){{
+        body{{padding:10px!important}}
+        .team-shell{{width:100%}}
+        .team-nav{{overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}}
+        .team-nav a{{white-space:nowrap;flex:0 0 auto}}
+        .hero{{padding:15px;border-radius:16px}}
+        .hero h2{{font-size:24px}}
+        .sub{{font-size:13px;line-height:1.5}}
+        .date-nav{{margin-top:15px}}
+        .date-nav b{{font-size:16px}}
+        .summary-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}
+        .team-card{{padding:12px}}
+        .team-card b{{font-size:21px}}
+        .desktop-table{{display:none}}
+        .mobile-cards{{display:grid;gap:10px}}
+        .section-block{{margin-top:20px}}
+        .section-block h3,.set-card h3{{font-size:20px}}
+      }}
+      @media(max-width:380px){{
+        .summary-grid{{grid-template-columns:1fr 1fr}}
+        .team-card b{{font-size:18px}}
+        .member-periods{{grid-template-columns:1fr}}
+      }}
+    </style>
+    <div class='team-shell'>
+      <div class='team-nav'><a href='/'>등급조회</a><a href='/team'><b>팀 페이지</b></a><a href='/team-logout'>로그아웃</a></div>
+      <section class='hero'>
+        <h2>{_team_escape(team.get('name'))}</h2>
+        <div class='sub'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
+        <div class='date-nav'><a href='/team?day={prev_day}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}'>다음날 →</a></div>
+        <div class='summary-grid'>
+          <div class='team-card'>신청 세트<b>{set_count}세트</b></div>
+          <div class='team-card'>완료<b>{day_complete}/{day_quota}</b></div>
+          <div class='team-card'>거절<b>{day_reject}</b></div>
+          <div class='team-card'>취소<b>{day_cancel}</b></div>
+        </div>
+        <div class='progress-wrap'><div class='progress-label'><span>오늘 팀 달성률</span><b>{progress}%</b></div><div class='progress-bar'><i></i></div></div>
+      </section>
+
+      <section class='section-block'>
+        <h3>팀 전체 구간 현황</h3>
+        <div class='desktop-table'><table><thead><tr><th>구간</th><th>시간</th><th>완료/할당량</th><th>거절</th><th>취소</th><th>달성률</th></tr></thead><tbody>{period_rows}</tbody></table></div>
+        <div class='mobile-cards'>{period_cards}</div>
+      </section>
+
+      {member_table}
+      {set_form}
     </div>
-    <h3>팀 전체 구간 현황</h3><div style='overflow:auto;background:#fff;border:1px solid #ddd;border-radius:14px'><table style='width:100%;border-collapse:collapse'><thead><tr><th>구간</th><th>시간</th><th>완료/할당량</th><th>거절</th><th>취소</th><th>달성률</th></tr></thead><tbody>{period_rows}</tbody></table></div>
-    {member_table}{set_form}
-    <style>.team-card{{padding:12px;border:1px solid #eee;border-radius:12px;color:#777}}.team-card b{{display:block;font-size:22px;color:#111;margin-top:5px}}th,td{{padding:10px;border-bottom:1px solid #eee;text-align:center;white-space:nowrap}}@media(max-width:700px){{.team-card{{min-width:0}}}}</style>
     """
     return HTMLResponse(html_page("팀 페이지", body))
