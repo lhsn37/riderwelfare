@@ -983,6 +983,9 @@ def get_backup_payload() -> Dict[str, Any]:
         Path(OVERRIDE_FILE), Path(LOGIN4_FILE), Path(PREVPLUS_FILE),
         Path(PLANNEDPLUS_FILE), Path(ATTENDANCE_FILE), Path(STICKER_FILE),
         Path(ADMIN_SETTINGS_FILE),
+        STORE_DIR / "teams.json",
+        STORE_DIR / "team_weekly_sets.json",
+        STORE_DIR / "team_period_stats.json",
     ]
 
     for path in paths:
@@ -1040,6 +1043,9 @@ def restore_backup_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         Path(ATTENDANCE_FILE).name: Path(ATTENDANCE_FILE),
         Path(STICKER_FILE).name: Path(STICKER_FILE),
         Path(ADMIN_SETTINGS_FILE).name: Path(ADMIN_SETTINGS_FILE),
+        "teams.json": STORE_DIR / "teams.json",
+        "team_weekly_sets.json": STORE_DIR / "team_weekly_sets.json",
+        "team_period_stats.json": STORE_DIR / "team_period_stats.json",
     }
 
     files = payload.get("files") or {}
@@ -5053,6 +5059,14 @@ def admin_teams_page(request: Request, edit_id: str = ""):
 
     edit_team = next((t for t in teams if str(t.get("id")) == str(edit_id)), None)
     leader_selected = str((edit_team or {}).get("leader_key") or "")
+    default_team_start = operation_date().isoformat()
+    if edit_team:
+        saved_start = safe_date_parse(str(edit_team.get("team_start_date") or ""))
+        if saved_start:
+            default_team_start = saved_start.isoformat()
+        else:
+            created_text = str(edit_team.get("created_at") or "")[:10]
+            default_team_start = (safe_date_parse(created_text) or operation_date()).isoformat()
     member_selected = set((edit_team or {}).get("member_keys") or [])
     options = []
     checks = []
@@ -5073,6 +5087,7 @@ def admin_teams_page(request: Request, edit_id: str = ""):
         team_cards += f"""
         <div style='border:1px solid #e5e5e5;border-radius:14px;padding:14px;background:#fff;margin-bottom:10px;'>
           <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;'><div><b style='font-size:18px'>{_team_escape(t.get('name'))}</b><div style='color:#666;margin-top:5px'>팀장 {_team_escape(leader.get('name','-'))} · 총 {1+len(members)}명</div></div><a href='/admin/teams?edit_id={_team_escape(t.get('id'))}'>수정</a></div>
+          <div style='margin-top:8px;color:#555'>팀 생성일: <b>{_team_escape(t.get('team_start_date') or str(t.get('created_at') or '')[:10] or '-')}</b></div>
           <div style='margin-top:8px;color:#555'>팀원: {_team_escape(', '.join(members) if members else '없음')}</div>
           <form method='post' action='/admin/team-delete' style='margin-top:10px' onsubmit="return confirm('팀을 해체하시겠습니까?')"><input type='hidden' name='team_id' value='{_team_escape(t.get('id'))}'><button style='border:1px solid #ddd;background:#fff;border-radius:8px;padding:7px 10px'>팀 해체</button></form>
         </div>"""
@@ -5086,6 +5101,8 @@ def admin_teams_page(request: Request, edit_id: str = ""):
         <form method='post' action='/admin/team-save'>
           <input type='hidden' name='team_id' value='{_team_escape((edit_team or {}).get('id',''))}'>
           <label>팀명</label><input name='team_name' value='{_team_escape((edit_team or {}).get('name',''))}' required style='width:100%;box-sizing:border-box;padding:11px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px'>
+          <label>팀 생성일</label><input type='date' name='team_start_date' value='{_team_escape(default_team_start)}' max='{operation_date().isoformat()}' required style='width:100%;box-sizing:border-box;padding:11px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px'>
+          <div style='color:#777;font-size:13px;margin:-8px 0 14px'>선택한 날짜부터 팀 과거 운행기록을 조회합니다.</div>
           <label>팀장 선택</label><select name='leader_key' required style='width:100%;padding:11px;border:1px solid #ddd;border-radius:10px;margin:6px 0 14px'><option value=''>팀장 선택</option>{''.join(options)}</select>
           <div style='font-weight:700;margin-bottom:6px'>팀원 선택</div><div style='max-height:420px;overflow:auto;border:1px solid #ddd;border-radius:10px'>{''.join(checks)}</div>
           <button style='width:100%;margin-top:14px;padding:12px;border:none;border-radius:10px;background:#111;color:#fff;font-weight:800'>{'팀 수정 저장' if edit_team else '팀 생성'}</button>
@@ -5103,12 +5120,15 @@ async def admin_team_save(request: Request):
     form = await request.form()
     team_id = str(form.get("team_id") or "").strip()
     team_name = str(form.get("team_name") or "").strip()
+    team_start_date = safe_date_parse(str(form.get("team_start_date") or "").strip())
     leader_key = str(form.get("leader_key") or "").strip()
     member_keys = [str(x) for x in form.getlist("member_keys") if str(x)]
     member_keys = [x for x in dict.fromkeys(member_keys) if x != leader_key]
     directory = rider_directory()
-    if not team_name or leader_key not in directory:
+    if not team_name or leader_key not in directory or team_start_date is None:
         return RedirectResponse("/admin/teams", status_code=303)
+    if team_start_date > operation_date():
+        team_start_date = operation_date()
 
     teams = load_teams()
     # Do not allow a rider to belong to multiple active teams.
@@ -5123,10 +5143,10 @@ async def admin_team_save(request: Request):
     if team_id:
         target = next((t for t in teams if str(t.get("id")) == team_id), None)
         if target:
-            target.update({"name": team_name, "leader_key": leader_key, "member_keys": member_keys, "active": True, "updated_at": now_text})
+            target.update({"name": team_name, "team_start_date": team_start_date.isoformat(), "leader_key": leader_key, "member_keys": member_keys, "active": True, "updated_at": now_text})
     else:
         next_id = str(max([int(t.get("id") or 0) for t in teams] + [0]) + 1)
-        teams.append({"id": next_id, "name": team_name, "leader_key": leader_key, "member_keys": member_keys, "active": True, "created_at": now_text, "updated_at": now_text})
+        teams.append({"id": next_id, "name": team_name, "team_start_date": team_start_date.isoformat(), "leader_key": leader_key, "member_keys": member_keys, "active": True, "created_at": now_text, "updated_at": now_text})
     save_teams(teams)
     return RedirectResponse("/admin/teams", status_code=303)
 
@@ -5229,7 +5249,13 @@ def team_page(request: Request, day: str = ""):
 
     capture_team_snapshot()
     directory = rider_directory()
-    op_day = safe_date_parse(day) or operation_date()
+    requested_day = safe_date_parse(day) or operation_date()
+    team_start = safe_date_parse(str(team.get("team_start_date") or ""))
+    if team_start is None:
+        team_start = safe_date_parse(str(team.get("created_at") or "")[:10]) or operation_date()
+    op_day = min(requested_day, operation_date())
+    if op_day < team_start:
+        op_day = team_start
     ws = current_team_week_start(op_day)
     rec = team_week_record(str(team.get("id")), ws)
     set_count = int(rec.get("set_count") or 0) if rec.get("status") in ("approved", "pending") else 0
@@ -5309,8 +5335,10 @@ def team_page(request: Request, day: str = ""):
           </form>
         </section>"""
 
-    prev_day = op_day - timedelta(days=1)
+    prev_day = max(team_start, op_day - timedelta(days=1))
     next_day = min(operation_date(), op_day + timedelta(days=1))
+    prev_disabled = op_day <= team_start
+    next_disabled = op_day >= operation_date()
     progress = round(day_complete / day_quota * 100, 1) if day_quota else 0
 
     body = f"""
@@ -5393,8 +5421,8 @@ def team_page(request: Request, day: str = ""):
       <div class='team-nav'><a href='/'>등급조회</a><a href='/team'><b>팀 페이지</b></a><a href='/team-logout'>로그아웃</a></div>
       <section class='hero'>
         <h2>{_team_escape(team.get('name'))}</h2>
-        <div class='sub'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
-        <div class='date-nav'><a href='/team?day={prev_day}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}'>다음날 →</a></div>
+        <div class='sub'>팀장 {_team_escape(leader_name)} · 총 {len(team_all_keys(team))}명 · 팀 생성일 {team_start} · {'팀장 상세권한' if leader_mode else '팀원 조회권한'}</div>
+        <div class='date-nav'><a href='/team?day={prev_day}' style='{"pointer-events:none;opacity:.35" if prev_disabled else ""}'>← 이전날</a><b>{op_day}</b><a href='/team?day={next_day}' style='{"pointer-events:none;opacity:.35" if next_disabled else ""}'>다음날 →</a></div>
         <div class='summary-grid'>
           <div class='team-card'>신청 세트<b>{set_count}세트</b></div>
           <div class='team-card'>완료<b>{day_complete}/{day_quota}</b></div>
