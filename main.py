@@ -157,8 +157,33 @@ _sticker_lock = threading.Lock()
 _rate_bucket: Dict[str, List[float]] = {}
 
 # 저장 위치
-STORE_DIR = Path(os.getenv("STORE_DIR", "."))
-STORE_DIR.mkdir(parents=True, exist_ok=True)
+# Render 배포 때 프로젝트 폴더(.)는 초기화될 수 있으므로, 영구 디스크를 우선 사용합니다.
+def _resolve_store_dir() -> Path:
+    configured = (os.getenv("STORE_DIR") or "").strip()
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Render Persistent Disk의 일반적인 마운트 경로
+    persistent = Path("/var/data")
+    try:
+        if persistent.exists() or persistent.parent.exists():
+            persistent.mkdir(parents=True, exist_ok=True)
+            test = persistent / ".rw_test"
+            test.write_text("ok", encoding="utf-8")
+            test.unlink(missing_ok=True)
+            return persistent
+    except Exception:
+        pass
+
+    # 로컬 개발 환경에서만 현재 폴더 사용
+    fallback = Path(".")
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+STORE_DIR = _resolve_store_dir()
+print(f"[storage] STORE_DIR={STORE_DIR.resolve()}")
 
 # Render Disk를 쓰는 경우, 모든 운영 데이터 파일을 STORE_DIR에 저장합니다.
 # 기존 루트 경로에 남아있던 파일은 최초 실행 시 STORE_DIR로 1회 복사합니다.
@@ -906,16 +931,37 @@ def fetch_riders_cached() -> List[Dict[str, Any]]:
     return riders
 
 
-def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
-    key = f"{from_d.isoformat()}_{to_d.isoformat()}"
-    now = time.time()
-    cached = _status_cache.get(key)
-    if cached and now - cached["ts"] <= STATUS_CACHE_TTL:
-        return cached["data"]
+def _status_complete_map_with_fallback(all_status: Dict[str, Any], from_d: date, to_d: date) -> Dict[str, int]:
+    """정확한 범위가 아직 수집 중이면 같은 시작일의 가장 최근 정상 범위를 임시 사용합니다.
 
-    all_status = _read_json(STATUS_STORE, {})
-    raw = all_status.get(key) or {}
-    # 신형: {completeMap, historyMap}; 구형: completeMap 자체
+    새 운영일에 모든 기사 기간키가 하루씩 바뀌면서 재수집되는 동안 화면이 0건으로
+    초기화되어 보이는 현상을 막습니다. 새 범위 저장이 끝나면 자동으로 정확한 값으로 교체됩니다.
+    """
+    wanted_key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+    raw = all_status.get(wanted_key) if isinstance(all_status, dict) else None
+
+    if not isinstance(raw, dict) or not raw:
+        best_to = None
+        best_raw = None
+        prefix = from_d.isoformat() + "_"
+        if isinstance(all_status, dict):
+            for key, candidate in all_status.items():
+                if not isinstance(key, str) or not key.startswith(prefix):
+                    continue
+                try:
+                    cand_to = date.fromisoformat(key.split("_", 1)[1])
+                except Exception:
+                    continue
+                if cand_to > to_d:
+                    continue
+                cmap = candidate.get("completeMap") if isinstance(candidate, dict) else None
+                if not isinstance(cmap, dict) or not cmap:
+                    continue
+                if best_to is None or cand_to > best_to:
+                    best_to = cand_to
+                    best_raw = candidate
+        raw = best_raw or {}
+
     m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
     out: Dict[str, int] = {}
     if isinstance(m, dict):
@@ -924,7 +970,18 @@ def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]
                 out[str(k)] = int(v)
             except Exception:
                 pass
+    return out
 
+
+def fetch_status_complete_map_cached(from_d: date, to_d: date) -> Dict[str, int]:
+    key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+    now = time.time()
+    cached = _status_cache.get(key)
+    if cached and now - cached["ts"] <= STATUS_CACHE_TTL:
+        return cached["data"]
+
+    all_status = _read_json(STATUS_STORE, {}) or {}
+    out = _status_complete_map_with_fallback(all_status, from_d, to_d)
     _status_cache[key] = {"ts": now, "data": out}
     return out
 
@@ -1482,8 +1539,19 @@ def ingest_ranges(request: Request):
                     pass
 
         if not is_saved:
-            out.append({"fromDate": from_d, "toDate": to_d})
+            out.append({"fromDate": from_d, "toDate": to_d, "kind": "team_history" if require_history else "status"})
 
+    # 등급용 최신 범위를 먼저 내려보내 화면 복구를 우선합니다.
+    out.sort(key=lambda x: (
+        1 if x.get("kind") == "team_history" else 0,
+        str(x.get("toDate") or ""),
+        str(x.get("fromDate") or ""),
+    ), reverse=False)
+    status_rows = [x for x in out if x.get("kind") != "team_history"]
+    team_rows = [x for x in out if x.get("kind") == "team_history"]
+    status_rows.sort(key=lambda x: (str(x.get("toDate") or ""), str(x.get("fromDate") or "")), reverse=True)
+    team_rows.sort(key=lambda x: str(x.get("fromDate") or ""), reverse=True)
+    out = status_rows + team_rows
     return {"ok": True, "ranges": out, "count": len(out)}
 
 
@@ -2891,17 +2959,7 @@ def dashboard(request: Request, q: str = ""):
     dashboard_status_store = _read_json(STATUS_STORE, {}) or {}
 
     def dashboard_complete_map(from_d: date, to_d: date) -> Dict[str, int]:
-        key = f"{from_d.isoformat()}_{to_d.isoformat()}"
-        raw = dashboard_status_store.get(key) or {}
-        m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
-        out_map: Dict[str, int] = {}
-        if isinstance(m, dict):
-            for k, v in m.items():
-                try:
-                    out_map[str(k)] = int(v)
-                except Exception:
-                    pass
-        return out_map
+        return _status_complete_map_with_fallback(dashboard_status_store, from_d, to_d)
 
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
@@ -3246,52 +3304,35 @@ def dashboard(request: Request, q: str = ""):
       }}
       .dashboard-table-wrap {{ margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px; }}
       @media (max-width:768px) {{
-        .dashboard-card {{ padding:12px; border-radius:14px; }}
+        .dashboard-card {{ padding:10px !important; border-radius:12px !important; }}
         .dashboard-header {{ display:block !important; }}
-        .dashboard-nav {{ display:grid !important; grid-template-columns:1fr 1fr; gap:8px !important; margin-top:12px; }}
-        .dashboard-nav a {{ width:100%; min-height:44px; text-align:center; font-size:14px; }}
-        .dashboard-search {{ display:grid !important; grid-template-columns:1fr; gap:8px !important; flex-basis:100% !important; }}
-        .dashboard-search button {{ width:100%; }}
-        .dashboard-table-wrap {{ overflow:visible; border:0; background:transparent; }}
-        .dashboard-table {{ min-width:0 !important; display:block; }}
-        .dashboard-table thead {{ display:none; }}
-        .dashboard-table tbody {{ display:grid; gap:12px; }}
-        .dashboard-table tr.bulk-row {{
-          display:block; background:#fff; border:1px solid #e5e7eb;
-          border-radius:14px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,.04);
-        }}
-        .dashboard-table tr.bulk-row td {{
-          display:grid; grid-template-columns:112px minmax(0,1fr);
-          gap:10px; align-items:start; width:100% !important; min-width:0 !important;
-          padding:10px 4px !important; border-bottom:1px solid #f0f0f0 !important;
-          text-align:left !important;
-        }}
-        .dashboard-table tr.bulk-row td:last-child {{ border-bottom:0 !important; }}
-        .dashboard-table tr.bulk-row td::before {{ font-size:12px; font-weight:800; color:#6b7280; line-height:1.5; }}
-        .dashboard-table tr.bulk-row td:nth-child(1)::before {{ content:'순번'; }}
-        .dashboard-table tr.bulk-row td:nth-child(2)::before {{ content:'기사 / 오늘비율'; }}
-        .dashboard-table tr.bulk-row td:nth-child(3)::before {{ content:'로그인 설정'; }}
-        .dashboard-table tr.bulk-row td:nth-child(4)::before {{ content:'배민 입사일'; }}
-        .dashboard-table tr.bulk-row td:nth-child(5)::before {{ content:'기준일'; }}
-        .dashboard-table tr.bulk-row td:nth-child(6)::before {{ content:'평가기간'; }}
-        .dashboard-table tr.bulk-row td:nth-child(7)::before {{ content:'오늘 운행'; }}
-        .dashboard-table tr.bulk-row td:nth-child(8)::before {{ content:'현재 완료'; }}
-        .dashboard-table tr.bulk-row td:nth-child(9)::before {{ content:'현재 등급'; }}
-        .dashboard-table tr.bulk-row td:nth-child(10)::before {{ content:'예정 등급'; }}
-        .dashboard-table tr.bulk-row td:nth-child(11)::before {{ content:'다음 등급'; }}
-        .dashboard-table tr.bulk-row td:nth-child(12)::before {{ content:'남은 건수'; }}
-        .dashboard-table tr.bulk-row td:nth-child(13)::before {{ content:'이전 플러스'; }}
-        .dashboard-table tr.bulk-row td:nth-child(14)::before {{ content:'예정 플러스'; }}
-        .dashboard-table tr.bulk-row td form {{ width:100%; }}
-        .dashboard-table tr.bulk-row td form[style*="display:flex"] {{ display:grid !important; grid-template-columns:1fr auto; gap:6px !important; }}
-        .dashboard-table tr.bulk-row td input:not([type=checkbox]) {{ width:100% !important; }}
-        .dashboard-table tr.bulk-row td button {{ white-space:nowrap; }}
-        #bulkSaveResult {{ display:block; width:100%; margin-top:4px; }}
+        .dashboard-nav {{ display:flex !important; overflow-x:auto; flex-wrap:nowrap !important; gap:7px !important; margin-top:10px; padding-bottom:4px; }}
+        .dashboard-nav a {{ flex:0 0 auto; min-height:40px; padding:8px 10px; font-size:13px; white-space:nowrap; }}
+        .dashboard-search {{ display:grid !important; grid-template-columns:1fr auto; gap:6px !important; flex-basis:100% !important; }}
+        .dashboard-search input {{ min-width:0; font-size:16px !important; }}
+        .dashboard-search button {{ width:auto; min-width:68px; }}
+        .dashboard-table-wrap {{ overflow:auto !important; border:1px solid #eee !important; -webkit-overflow-scrolling:touch; max-height:72vh; }}
+        .dashboard-table {{ display:table !important; min-width:1900px !important; font-size:12px; }}
+        .dashboard-table thead {{ display:table-header-group !important; position:sticky; top:0; z-index:6; background:#fafafa; }}
+        .dashboard-table tbody {{ display:table-row-group !important; }}
+        .dashboard-table tr.bulk-row {{ display:table-row !important; box-shadow:none !important; }}
+        .dashboard-table tr.bulk-row td {{ display:table-cell !important; width:auto !important; min-width:0; padding:7px 6px !important; border-bottom:1px solid #eee !important; white-space:nowrap; vertical-align:middle; }}
+        .dashboard-table tr.bulk-row td::before {{ content:none !important; }}
+        .dashboard-table th {{ padding:8px 6px !important; white-space:nowrap; }}
+        .dashboard-table th:nth-child(1), .dashboard-table td:nth-child(1) {{ position:sticky; left:0; z-index:4; background:#fff; min-width:38px; }}
+        .dashboard-table th:nth-child(2), .dashboard-table td:nth-child(2) {{ position:sticky; left:38px; z-index:4; background:#fff; min-width:135px; box-shadow:2px 0 4px rgba(0,0,0,.06); }}
+        .dashboard-table thead th:nth-child(1), .dashboard-table thead th:nth-child(2) {{ background:#fafafa; z-index:8; }}
+        .dashboard-table tr.bulk-row td form {{ width:auto; }}
+        .dashboard-table tr.bulk-row td form[style*="display:flex"] {{ display:flex !important; }}
+        .dashboard-table tr.bulk-row td input:not([type=checkbox]) {{ width:82px !important; padding:6px 7px !important; }}
+        .dashboard-table tr.bulk-row td button {{ padding:6px 8px !important; font-size:12px; }}
+        #bulkSaveResult {{ font-size:12px !important; }}
       }}
       @media (max-width:420px) {{
-        .dashboard-nav {{ grid-template-columns:1fr; }}
-        .dashboard-table tr.bulk-row td {{ grid-template-columns:96px minmax(0,1fr); gap:8px; }}
+        .dashboard-table {{ min-width:1780px !important; }}
+        .dashboard-nav a {{ font-size:12px; }}
       }}
+
     </style>
     <div class="dashboard-card" style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
       <div class="dashboard-header" style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
