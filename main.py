@@ -1433,6 +1433,24 @@ def ingest_ranges(request: Request):
                 # 구버전 completeMap 자체 저장 형식도 완료된 범위로 인정합니다.
                 is_saved = isinstance(saved, dict) and len(saved) > 0
 
+            # 전날로 끝나는 등급 범위는 새 운영일(06:00) 이후 최소 한 번 다시 수집합니다.
+            # 배민 통계가 마감되기 전에 저장된 값이 남아 마지막 날 건수가 빠지는 문제를 방지합니다.
+            try:
+                range_to = date.fromisoformat(to_d)
+                yesterday = operation_date() - timedelta(days=1)
+                updated_raw = str(saved.get("updated_at") or "") if isinstance(saved, dict) else ""
+                updated_dt = datetime.fromisoformat(updated_raw) if updated_raw else None
+                refreshed_today = bool(updated_dt and updated_dt.astimezone(KST).date() == now_kst().date())
+                if range_to == yesterday and not refreshed_today:
+                    is_saved = False
+            except Exception:
+                # 갱신시각을 판별할 수 없으면 최근 마감 범위를 안전하게 다시 받습니다.
+                try:
+                    if date.fromisoformat(to_d) == operation_date() - timedelta(days=1):
+                        is_saved = False
+                except Exception:
+                    pass
+
         if not is_saved:
             out.append({"fromDate": from_d, "toDate": to_d})
 
@@ -2821,9 +2839,12 @@ def dashboard(request: Request, q: str = ""):
         return not_ready_page()
 
     riders = fetch_riders_cached()
+    # 관리자 페이지 성능 최적화: 설정 파일은 요청당 한 번만 읽습니다.
     join_overrides = load_overrides()
+    login4_map = load_login4_map()
     prevplus_map = load_prevplus_map()
     plannedplus_map = load_plannedplus_map()
+    sticker_map = load_sticker_map()
     qn = norm_name(q)
 
     rider_rows = []
@@ -2850,11 +2871,28 @@ def dashboard(request: Request, q: str = ""):
         real4 = last4_from_phone(ph)
         nn = norm_name(nm)
 
-        login4, _, login_src = get_login4_for_rider(rr)
+        real_lookup_key = f"{nn}|{real4}"
+        mapped_login4 = str(login4_map.get(real_lookup_key) or "").strip()
+        if re.fullmatch(r"\d{4}", mapped_login4):
+            login4, login_src = mapped_login4, "override"
+        else:
+            login4, login_src = real4, "real"
+
         real_key = f"{nn}|{real4}"
         login_key = f"{nn}|{login4}"
 
-        eff_join, join_src = get_effective_join_date_by_login_key(rr, login4)
+        ov_join = join_overrides.get(login_key)
+        eff_join = safe_date_parse(ov_join) if ov_join else None
+        if eff_join is not None:
+            join_src = "override"
+        else:
+            created_raw = rr.get("createdDate")
+            eff_join = safe_date_parse(created_raw[:10]) if isinstance(created_raw, str) and len(created_raw) >= 10 else None
+            if eff_join is not None:
+                join_src = "createdDate"
+            else:
+                eff_join = today
+                join_src = "fallback"
 
         cur_start, cur_end_incl = current_period(eff_join, today)
         cur_from, cur_to = period_to_from_to(cur_start, cur_end_incl)
@@ -2914,9 +2952,10 @@ def dashboard(request: Request, q: str = ""):
             cur_completed_raw = int(cmap.get(it["real_key"], 0))
             prev_completed_raw = int(prev_completed_map.get(it["real_key"], 0))
 
-            prev_plus = get_prevplus(it["login_key"])
-            planned_plus_base = get_plannedplus(it["login_key"])
-            sticker_bonus = get_sticker_bonus(it["login_key"])
+            prev_plus = int(prevplus_map.get(it["login_key"], 0) or 0)
+            planned_plus_base = int(plannedplus_map.get(it["login_key"], 0) or 0)
+            sticker_attached = bool(sticker_map.get(it["login_key"], False))
+            sticker_bonus = 20 if sticker_attached else 0
             planned_plus = planned_plus_base + sticker_bonus
 
             planned_total = cur_completed_raw + planned_plus
@@ -2944,9 +2983,7 @@ def dashboard(request: Request, q: str = ""):
                 **calc_bad_ratio(0, 0, 0),
             }
 
-            rider_phone = normalize_phone(rr.get("phoneNumber", "") or "")
-            roulette_status = roulette_db.get_status(rider_phone, nm, int(today_info["complete"]))
-
+            # 룰렛 상태는 관리자 표에서 사용하지 않으므로 전원 DB 조회를 생략합니다.
             final_rows.append({
                 "name": nm,
                 "created": created_d,
@@ -2981,11 +3018,9 @@ def dashboard(request: Request, q: str = ""):
                 "today_ratio_bg": str(today_info["bg"]),
                 "today_ratio_label": str(today_info["label"]),
                 "today_status_desc": str(today_info["status_desc"]),
-                "roulette_remain": int(roulette_status.get("remain_count") or 0),
-                "roulette_weekly_total": int(roulette_status.get("weekly_total") or 0),
                 "planned_plus_base": planned_plus_base,
                 "sticker_bonus": sticker_bonus,
-                "sticker_attached": is_sticker_attached(it["login_key"]),
+                "sticker_attached": sticker_attached,
             })
 
     final_rows.sort(key=lambda x: (x["cur_completed_raw"], -x["today_ratio"]), reverse=True)
