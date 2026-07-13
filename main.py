@@ -1586,20 +1586,14 @@ def admin_help():
         <div>- 단, PC에서 그 기간({NMAX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
       </div>
 
-      <div style="margin-top:14px; background:#eef6ff; border:1px solid #cfe3ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
-        <div><b>플러스 백업 / 복원</b></div>
-        <div>- 관리자 대시보드에서 <b>플러스 백업 엑셀</b> 다운로드 가능</div>
-        <div>- 코드 업데이트 후 기존 <b>dashboard.xlsx</b> 또는 <b>plus-backup.xlsx</b> 업로드 시</div>
-        <div>&nbsp;&nbsp;→ <b>이전등급 플러스(prev_plus)</b>, <b>예정등급 플러스(planned_plus)</b> 자동 복원</div>
+      <div style="margin-top:14px; background:#eef6ff; border:1px solid #cfe3ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
+        <div><b>관리 메뉴</b></div>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+          <a href="/dashboard" style="text-decoration:none;color:#111;font-weight:900;">전체 등급 현황</a>
+          <a href="/admin/roulette" style="text-decoration:none;color:#111;font-weight:900;">룰렛 관리</a>
+          <a href="/admin/teams" style="text-decoration:none;color:#111;font-weight:900;">팀 구성 관리</a>
+        </div>
       </div>
-
-      <div style="margin-top:14px; background:#f5f7ff; border:1px solid #d9e1ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
-        <div><b>룰렛 운영주차</b></div>
-        <div>- 현재 운영주차: <b>{cycle["display_start"]}</b> ~ <b>{cycle["display_end"]}</b></div>
-        <div>- 직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b></div>
-        <div>- 지급 CSV: <b>/admin/api/roulette/payout.csv</b> (기본은 직전 마감 주차)</div>
-      </div>
-
       <div style="margin-top:14px; background:#f7fff5; border:1px solid #cfe8c8; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
         <div><b>전체 백업 / 전체 복원</b></div>
         <div>- 룰렛 확률, 룰렛 당첨 전체내역, 예정플러스, 이전플러스, 스티커, 입사일, 로그인용 뒷4자리, 관리자 비밀번호까지 포함합니다.</div>
@@ -1818,6 +1812,21 @@ def check(
 
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
+
+    # 성능 개선: 큰 상태 파일은 관리자 페이지 요청당 한 번만 읽습니다.
+    dashboard_status_store = _read_json(STATUS_STORE, {}) or {}
+    def dashboard_complete_map(from_d: date, to_d: date) -> Dict[str, int]:
+        key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+        raw = dashboard_status_store.get(key) or {}
+        m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
+        out_map: Dict[str, int] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                try:
+                    out_map[str(k)] = int(v)
+                except Exception:
+                    pass
+        return out_map
     today_info = today_stats_map.get(api_key) or {
         "complete": 0,
         "reject": 0,
@@ -2932,7 +2941,7 @@ def dashboard(request: Request, q: str = ""):
                 prev_completed_map[it["real_key"]] = 0
             continue
 
-        cmap = fetch_status_complete_map_cached(from_d, to_d)
+        cmap = dashboard_complete_map(from_d, to_d)
         for it in items:
             prev_completed_map[it["real_key"]] = int(cmap.get(it["real_key"], 0))
 
@@ -2941,7 +2950,7 @@ def dashboard(request: Request, q: str = ""):
         if from_d > to_d:
             cmap = {}
         else:
-            cmap = fetch_status_complete_map_cached(from_d, to_d)
+            cmap = dashboard_complete_map(from_d, to_d)
 
         for it in items:
             rr = it["rider"]
@@ -3212,11 +3221,8 @@ def dashboard(request: Request, q: str = ""):
         </div>
 
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-            <a href="/dashboard.xlsx" style="text-decoration:none; color:#111;">전체 엑셀 다운로드</a>
-            <a href="/plus-backup.xlsx" style="text-decoration:none; color:#111;">플러스 백업 엑셀</a>
-            <a href="/admin/roulette" style="text-decoration:none; color:#111; font-weight:900;">룰렛 관리자</a>
-            <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 룰렛 지급CSV</a>
-            <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">룰렛 JSON</a>
+            <a href="/admin/roulette" style="text-decoration:none; color:#111; font-weight:900;">룰렛 관리</a>
+            <a href="/admin" style="text-decoration:none; color:#111;">관리자 도움말·전체 백업</a>
             <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
             <a href="/admin/teams" style="text-decoration:none; color:#111; font-weight:900;">팀 구성 관리</a>
         <a href="/admin/team-sets" style="text-decoration:none; color:#111; font-weight:900;">팀 세트 관리</a>
@@ -3224,9 +3230,6 @@ def dashboard(request: Request, q: str = ""):
         </div>
       </div>
 
-      <div style="margin-top:10px; color:#555; font-size:13px;">
-        직전 지급 주차: <b>{cycle["display_start"]}</b> ~ <b>{cycle["display_end"]}</b>
-      </div>
 
       <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
         <form method="get" action="/dashboard" style="display:flex; gap:8px; flex:1 1 480px;">
@@ -3239,19 +3242,9 @@ def dashboard(request: Request, q: str = ""):
           </button>
         </form>
 
-        <form method="post" action="/admin/restore-plus-xlsx" enctype="multipart/form-data"
-              style="display:flex; gap:8px; align-items:center; flex:1 1 420px; background:#f7f9fc; padding:10px 12px; border:1px solid #e4ebf5; border-radius:12px;">
-          <input type="file" name="file" accept=".xlsx"
-                 style="flex:1; font-size:14px;" required />
-          <button type="submit"
-                  style="font-size:14px; padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff;">
-            플러스 복원 업로드
-          </button>
-        </form>
       </div>
 
       <div style="margin-top:8px; color:#777; font-size:13px;">
-        * 기존 <b>dashboard.xlsx</b> 또는 <b>플러스 백업 엑셀</b> 업로드 가능 (권장 컬럼: name / login_key / real4 / prev_plus / planned_plus / sticker_attached)<br/>
         * 예정등급 플러스 입력칸은 <b>수동 플러스</b>만 입력합니다. 스티커 +20은 자동으로 별도 합산됩니다.
       </div>
 
@@ -3561,401 +3554,111 @@ def admin_roulette_page(request: Request):
     r = require_admin(request)
     if r:
         return r
-
-    current_cycle = get_operational_cycle_bounds()
-    prev_cycle = get_previous_operational_cycle_bounds()
-
-    body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
-      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
-        <div>
-          <h2 style="margin:0 0 6px 0;">룰렛 관리자</h2>
-          <div style="color:#666; line-height:1.7;">
-            현재 운영주차: <b>{current_cycle["display_start"]}</b> ~ <b>{current_cycle["display_end"]}</b><br/>
-            직전 마감 주차: <b>{prev_cycle["display_start"]}</b> ~ <b>{prev_cycle["display_end"]}</b>
-          </div>
-        </div>
-
-        <div style="display:flex; gap:8px; flex-wrap:wrap;">
-          <a href="/dashboard" style="text-decoration:none; color:#111;">전체 대시보드</a>
-          <a href="/admin/api/roulette/payout.csv" style="text-decoration:none; color:#111;">직전주 지급 CSV</a>
-          <a href="/admin/api/roulette/export" style="text-decoration:none; color:#111;">JSON 내보내기</a>
-          <a href="/admin-logout" style="text-decoration:none; color:#666;">로그아웃</a>
-        </div>
+    body = """
+    <div style="max-width:760px;margin:0 auto;background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:18px;">
+      <h2 style="margin:0 0 14px;">룰렛 관리</h2>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;">
+        <a href="/admin/roulette/rules" style="text-decoration:none;color:#111;border:1px solid #ddd;border-radius:14px;padding:18px;background:#fafafa;">
+          <div style="font-size:18px;font-weight:900;">룰렛 규칙 관리</div>
+          <div style="margin-top:6px;color:#666;font-size:13px;">사용 여부, 기준 건수, 구간별 확률 설정</div>
+        </a>
+        <a href="/admin/roulette/history" style="text-decoration:none;color:#111;border:1px solid #ddd;border-radius:14px;padding:18px;background:#fafafa;">
+          <div style="font-size:18px;font-weight:900;">당첨내역 관리</div>
+          <div style="margin-top:6px;color:#666;font-size:13px;">조회·수정·삭제 및 룰렛 엑셀 다운로드</div>
+        </a>
       </div>
-
-      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
-          <div style="font-weight:900; margin-bottom:10px;">룰렛 복원 업로드</div>
-          <div style="color:#666; font-size:13px; line-height:1.6; margin-bottom:10px;">
-            export JSON 또는 백업 JSON 파일을 업로드해서 룰렛 설정/당첨내역을 복원합니다.
-          </div>
-
-        <form method="post" action="/admin/api/roulette/import" enctype="multipart/form-data"
-                     style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <input type="file" id="rouletteImportFile" name="file" accept=".json"
-                       style="font-size:14px;" required />
-            <button type="submit"
-                         style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900; cursor:pointer;">
-                업로드 복원
-             </button>
-         </form>
-
-  <div id="rouletteImportMsg" style="margin-top:10px; color:#666; font-size:13px;"></div>
-</div>
-
-      <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-        <div style="border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
-          <div style="font-weight:900; margin-bottom:10px;">기본 설정</div>
-          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-            <label style="display:flex; gap:6px; align-items:center;">
-              <input type="checkbox" id="rouletteEnabled" />
-              <span>룰렛 사용</span>
-            </label>
-
-            <label style="display:flex; gap:6px; align-items:center;">
-              <span>기준</span>
-              <input type="number" id="spinUnit" min="1" value="10"
-                     style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-              <span>건당 1회</span>
-            </label>
-
-            <label style="display:flex; gap:6px; align-items:center;">
-              <span>최대 구간</span>
-              <input type="number" id="maxSegmentValue" min="10" max="100" step="10" value="100"
-                     style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-            </label>
-
-            <button onclick="downloadRouletteHistoryCsv()"
-                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
-                CSV 다운로드
-            </button>
-
-            <button onclick="saveRouletteSettings()"
-                    style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
-              설정 저장
-            </button>
-
-            <button onclick="backupRouletteDb()"
-                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
-              DB 백업
-            </button>
-          </div>
-          <div id="saveMsg" style="margin-top:10px; color:#666; font-size:13px;"></div>
-        </div>
-
-        <div style="border:1px solid #eee; border-radius:14px; padding:14px; background:#fcfcfc;">
-          <div style="font-weight:900; margin-bottom:10px;">지급 다운로드</div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <input type="text" id="weekKeyInput" placeholder="예: 2026-03-04"
-                   style="width:180px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-            <button onclick="downloadPayoutCsv()"
-                    style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
-              주차 지정 CSV
-            </button>
-            <button onclick="downloadPrevPayoutCsv()"
-                    style="padding:10px 14px; border:1px solid #ddd; border-radius:12px; background:#fff; color:#111; font-weight:900;">
-              직전주 CSV
-            </button>
-          </div>
-          <div style="margin-top:8px; color:#888; font-size:12px;">
-            비워두면 직전 마감 운영주차 기준으로 다운로드됩니다.
-          </div>
-        </div>
-      </div>
-
-      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fff;">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-          <div style="font-weight:900;">구간별 확률 설정</div>
-          <div style="color:#777; font-size:13px;">10건 ~ 100건 구간별로 각각 수정 가능</div>
-        </div>
-        <div id="segmentRewardWrap" style="margin-top:12px; overflow:auto;"></div>
-      </div>
-
-      <div style="margin-top:16px; border:1px solid #eee; border-radius:14px; padding:14px; background:#fff;">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-          <div style="font-weight:900;">당첨 내역</div>
-          <div id="historySummary" style="color:#666; font-size:13px;"></div>
-        </div>
-
-        <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="date" id="startDate"
-                 style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-          <input type="date" id="endDate"
-                 style="padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-          <input type="text" id="keyword" placeholder="이름 또는 전화번호"
-                 style="width:220px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-          <button onclick="loadRouletteHistory()"
-                  style="padding:10px 14px; border:none; border-radius:12px; background:#111; color:#fff; font-weight:900;">
-            조회
-          </button>
-        </div>
-
-        <div style="margin-top:12px; overflow:auto; border:1px solid #eee; border-radius:12px;">
-          <table style="border-collapse:collapse; width:100%; min-width:1100px;">
-            <thead>
-              <tr style="background:#fafafa;">
-                <th style="padding:10px; border-bottom:1px solid #eee;">ID</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">날짜</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">시간</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">이름</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">전화번호</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">오늘완료</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">회차</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">구간</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">당첨금</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">비고</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">수정</th>
-                <th style="padding:10px; border-bottom:1px solid #eee;">삭제</th>
-              </tr>
-            </thead>
-            <tbody id="historyBody">
-              <tr><td colspan="12" style="padding:14px; color:#777;">불러오는 중...</td></tr>
-            </tbody>
-          </table>
-        </div>
+      <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;">
+        <a href="/dashboard" style="text-decoration:none;color:#111;">← 전체 등급 현황</a>
+        <a href="/admin" style="text-decoration:none;color:#111;">관리자 도움말·전체 백업</a>
       </div>
     </div>
+    """
+    return html_page("룰렛 관리", body)
 
+
+@app.get("/admin/roulette/rules", response_class=HTMLResponse)
+def admin_roulette_rules_page(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+    body = """
+    <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <h2 style="margin:0;">룰렛 규칙 관리</h2>
+        <a href="/admin/roulette" style="text-decoration:none;color:#111;">← 룰렛 관리</a>
+      </div>
+      <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
+        <label><input type="checkbox" id="rouletteEnabled"> 룰렛 사용</label>
+        <label>기준 <input type="number" id="spinUnit" min="1" value="10" style="width:80px;padding:8px;"> 건당 1회</label>
+        <label>최대 구간 <input type="number" id="maxSegmentValue" min="10" max="100" step="10" value="100" style="width:80px;padding:8px;"></label>
+        <button onclick="saveSettings()" style="padding:10px 14px;border:0;border-radius:10px;background:#111;color:#fff;font-weight:900;">저장</button>
+        <span id="msg" style="color:#666;"></span>
+      </div>
+      <div id="segments" style="margin-top:16px;overflow:auto;">불러오는 중...</div>
+    </div>
     <script>
-      function fmtMoney(v) {{
-        return Number(v || 0).toLocaleString() + '원';
-      }}
-
-      function fmtTs(ts) {{
-        if (!ts) return '-';
-        const d = new Date(Number(ts) * 1000);
-        const hh = String(d.getHours()).padStart(2, '0');
-        const mm = String(d.getMinutes()).padStart(2, '0');
-        const ss = String(d.getSeconds()).padStart(2, '0');
-        return `${{hh}}:${{mm}}:${{ss}}`;
-      }}
-
-      function segmentList() {{
-        const arr = [];
-        for (let i = 10; i <= 100; i += 10) arr.push(i);
-        return arr;
-      }}
-
-      async function loadRouletteSettings() {{
-        const res = await fetch('/admin/api/roulette/settings');
-        const data = await res.json();
-
-        document.getElementById('rouletteEnabled').checked = !!data.enabled;
-        document.getElementById('spinUnit').value = data.spin_unit || 10;
-        document.getElementById('maxSegmentValue').value = data.max_segment_value || 100;
-
-        const grouped = {{}};
-        (data.segment_rewards || []).forEach(r => {{
-          const seg = Number(r.segment_value || 0);
-          if (!grouped[seg]) grouped[seg] = [];
-          grouped[seg].push(r);
-        }});
-
-        const wrap = document.getElementById('segmentRewardWrap');
-        let html = `<table style="border-collapse:collapse; width:100%; min-width:900px;">
-          <thead>
-            <tr style="background:#fafafa;">
-              <th style="padding:10px; border-bottom:1px solid #eee;">구간</th>
-              <th style="padding:10px; border-bottom:1px solid #eee;">1000원</th>
-              <th style="padding:10px; border-bottom:1px solid #eee;">2000원</th>
-              <th style="padding:10px; border-bottom:1px solid #eee;">3000원</th>
-              <th style="padding:10px; border-bottom:1px solid #eee;">5000원</th>
-              <th style="padding:10px; border-bottom:1px solid #eee;">10000원</th>
-            </tr>
-          </thead>
-          <tbody>`;
-
-        const amounts = [1000, 2000, 3000, 5000, 10000];
-
-        segmentList().forEach(seg => {{
-          const rows = grouped[seg] || [];
-          const byAmount = {{}};
-          rows.forEach(r => byAmount[Number(r.amount)] = r);
-
-          html += `<tr>
-            <td style="padding:10px; border-bottom:1px solid #eee; font-weight:900;">${{seg}}건</td>`;
-
-          amounts.forEach(amount => {{
-            const row = byAmount[amount] || {{ weight: 0, active: 1 }};
-            html += `
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-                <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
-                  <input type="number"
-                         data-seg="${{seg}}"
-                         data-amount="${{amount}}"
-                         class="weight-input"
-                         value="${{row.weight || 0}}"
-                         style="width:90px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-                  <label style="font-size:12px; color:#666; display:flex; gap:4px; align-items:center;">
-                    <input type="checkbox"
-                           data-seg="${{seg}}"
-                           data-amount="${{amount}}"
-                           class="active-input"
-                           ${{row.active ? 'checked' : ''}} />
-                    사용
-                  </label>
-                </div>
-              </td>`;
-          }});
-
-          html += `</tr>`;
-        }});
-
-        html += `</tbody></table>`;
-        wrap.innerHTML = html;
-      }}
-
-      async function saveRouletteSettings() {{
-        const enabled = document.getElementById('rouletteEnabled').checked;
-        const spin_unit = Number(document.getElementById('spinUnit').value || 10);
-        const max_segment_value = Number(document.getElementById('maxSegmentValue').value || 100);
-
-        const payloadRows = [];
-        const amounts = [1000, 2000, 3000, 5000, 10000];
-
-        segmentList().forEach(seg => {{
-          amounts.forEach((amount, idx) => {{
-            const w = document.querySelector(`.weight-input[data-seg="${{seg}}"][data-amount="${{amount}}"]`);
-            const a = document.querySelector(`.active-input[data-seg="${{seg}}"][data-amount="${{amount}}"]`);
-            payloadRows.push({{
-              segment_value: seg,
-              amount: amount,
-              weight: Number(w?.value || 0),
-              active: !!a?.checked,
-              sort_order: idx + 1
-            }});
-          }});
-        }});
-
-        const res = await fetch('/admin/api/roulette/settings', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{
-            enabled,
-            spin_unit,
-            max_segment_value,
-            segment_rewards: payloadRows
-          }})
-        }});
-
-        const data = await res.json();
-        document.getElementById('saveMsg').innerText = data.ok ? '저장 완료' : (data.detail || '저장 실패');
-        if (data.ok) loadRouletteSettings();
-      }}
-
-      async function loadRouletteHistory() {{
-        const start_date = document.getElementById('startDate').value;
-        const end_date = document.getElementById('endDate').value;
-        const keyword = document.getElementById('keyword').value.trim();
-
-        const qs = new URLSearchParams();
-        if (start_date) qs.set('start_date', start_date);
-        if (end_date) qs.set('end_date', end_date);
-        if (keyword) qs.set('keyword', keyword);
-        qs.set('limit', '300');
-
-        const res = await fetch('/admin/api/roulette/history?' + qs.toString());
-        const data = await res.json();
-
-        const tbody = document.getElementById('historyBody');
-        const summary = document.getElementById('historySummary');
-        summary.innerText = `조회건수 ${{Number(data.summary?.count || 0)}}건 / 총 당첨금 ${{fmtMoney(data.summary?.total_amount || 0)}}`;
-
-        const rows = data.rows || [];
-        if (!rows.length) {{
-          tbody.innerHTML = '<tr><td colspan="12" style="padding:14px; color:#777;">조회 결과가 없습니다.</td></tr>';
-          return;
-        }}
-
-        let html = '';
-        rows.forEach(row => {{
-          html += `
-            <tr>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.id}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_date || '-'}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{fmtTs(row.created_at)}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.rider_name || ''}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.phone || ''}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.today_completed || 0}}</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.spin_index || 0}}회차</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">${{row.segment_value || 0}}건</td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-                <input type="number" id="amt_${{row.id}}" value="${{row.reward_amount || 0}}"
-                       style="width:100px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-              </td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-                <input type="text" id="note_${{row.id}}" value="${{row.note || ''}}"
-                       style="width:180px; padding:8px 10px; border:1px solid #ddd; border-radius:10px;" />
-              </td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-                <button onclick="updateRouletteSpin(${{row.id}})"
-                        style="padding:8px 12px; border:none; border-radius:10px; background:#111; color:#fff;">
-                  수정
-                </button>
-              </td>
-              <td style="padding:10px; border-bottom:1px solid #eee; text-align:center;">
-                <button onclick="deleteRouletteSpin(${{row.id}})"
-                        style="padding:8px 12px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111;">
-                  삭제
-                </button>
-              </td>
-            </tr>`;
-        }});
-
-        tbody.innerHTML = html;
-      }}
-
-      async function updateRouletteSpin(id) {{
-        const reward_amount = Number(document.getElementById('amt_' + id).value || 0);
-        const note = document.getElementById('note_' + id).value || '';
-
-        const res = await fetch('/admin/api/roulette/spin/update', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ spin_id: id, reward_amount, note }})
-        }});
-        const data = await res.json();
-        alert(data.ok ? '수정 완료' : (data.detail || '수정 실패'));
-        if (data.ok) loadRouletteHistory();
-      }}
-
-      async function deleteRouletteSpin(id) {{
-        if (!confirm('정말 삭제하시겠습니까?')) return;
-
-        const res = await fetch('/admin/api/roulette/spin/delete', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ spin_id: id }})
-        }});
-        const data = await res.json();
-        alert(data.ok ? '삭제 완료' : (data.detail || '삭제 실패'));
-        if (data.ok) loadRouletteHistory();
-      }}
-
-      async function backupRouletteDb() {{
-        const res = await fetch('/admin/api/roulette/backup', {{ method: 'POST' }});
-        const data = await res.json();
-        alert(data.ok ? ('백업 완료: ' + data.backup_name) : (data.detail || '백업 실패'));
-      }}
-
-      function downloadPrevPayoutCsv() {{
-        window.location.href = '/admin/api/roulette/payout.csv';
-      }}
-
-      function downloadPayoutCsv() {{
-        const weekKey = document.getElementById('weekKeyInput').value.trim();
-        if (!weekKey) {{
-          window.location.href = '/admin/api/roulette/payout.csv';
-          return;
-        }}
-        window.location.href = '/admin/api/roulette/payout.csv?week_key=' + encodeURIComponent(weekKey);
-      }}
-
-      loadRouletteSettings();
-      loadRouletteHistory();
+    const amounts=[1000,2000,3000,5000,10000];
+    function segmentList(){const max=Number(document.getElementById('maxSegmentValue').value||100);const unit=Number(document.getElementById('spinUnit').value||10);const a=[];for(let x=unit;x<=max;x+=unit)a.push(x);return a;}
+    async function loadSettings(){
+      const d=await (await fetch('/admin/api/roulette/settings')).json();
+      rouletteEnabled.checked=!!d.enabled; spinUnit.value=d.spin_unit||10; maxSegmentValue.value=d.max_segment_value||100;
+      const grouped={};(d.segment_rewards||[]).forEach(r=>{const s=Number(r.segment_value);(grouped[s]??=[]).push(r)});
+      let h='<table style="border-collapse:collapse;width:100%;min-width:850px"><tr><th style="padding:10px">구간</th>'+amounts.map(a=>`<th>${a.toLocaleString()}원</th>`).join('')+'</tr>';
+      segmentList().forEach(seg=>{const by={};(grouped[seg]||[]).forEach(r=>by[Number(r.amount)]=r);h+=`<tr><td style="padding:10px;font-weight:900">${seg}건</td>`;amounts.forEach(a=>{const r=by[a]||{weight:0,active:1};h+=`<td style="padding:8px;text-align:center"><input class="w" data-s="${seg}" data-a="${a}" type="number" value="${r.weight||0}" style="width:75px;padding:7px"><br><label style="font-size:12px"><input class="ac" data-s="${seg}" data-a="${a}" type="checkbox" ${r.active?'checked':''}>사용</label></td>`});h+='</tr>'});h+='</table>';segments.innerHTML=h;
+    }
+    async function saveSettings(){const rows=[];segmentList().forEach(s=>amounts.forEach((a,i)=>rows.push({segment_value:s,amount:a,weight:Number(document.querySelector(`.w[data-s="${s}"][data-a="${a}"]`).value||0),active:document.querySelector(`.ac[data-s="${s}"][data-a="${a}"]`).checked,sort_order:i+1})));const res=await fetch('/admin/api/roulette/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:rouletteEnabled.checked,spin_unit:Number(spinUnit.value||10),max_segment_value:Number(maxSegmentValue.value||100),segment_rewards:rows})});const d=await res.json();msg.textContent=d.ok?'저장 완료':(d.detail||'저장 실패');}
+    spinUnit.addEventListener('change',loadSettings);maxSegmentValue.addEventListener('change',loadSettings);loadSettings();
     </script>
     """
-    return html_page("룰렛 관리자", body)
+    return html_page("룰렛 규칙 관리", body)
+
+
+@app.get("/admin/roulette/history", response_class=HTMLResponse)
+def admin_roulette_history_page(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
+    body = """
+    <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <h2 style="margin:0;">룰렛 당첨내역</h2>
+        <div style="display:flex;gap:10px;flex-wrap:wrap"><a href="/admin/roulette/history.xlsx" style="text-decoration:none;color:#111;font-weight:900;">룰렛 엑셀 다운로드</a><a href="/admin/roulette" style="text-decoration:none;color:#111;">← 룰렛 관리</a></div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
+        <input id="start" type="date" style="padding:8px"><input id="end" type="date" style="padding:8px"><input id="kw" placeholder="이름/전화번호" style="padding:8px"><button onclick="loadHistory()" style="padding:9px 14px;border:0;border-radius:10px;background:#111;color:#fff;">조회</button>
+      </div>
+      <div id="summary" style="margin-top:12px;color:#666"></div>
+      <div style="overflow:auto;margin-top:10px"><table style="border-collapse:collapse;width:100%;min-width:980px"><thead><tr><th>ID</th><th>날짜</th><th>기사</th><th>전화</th><th>완료</th><th>회차</th><th>구간</th><th>당첨금</th><th>메모</th><th>수정</th><th>삭제</th></tr></thead><tbody id="rows"></tbody></table></div>
+    </div>
+    <script>
+    async function loadHistory(){const q=new URLSearchParams({limit:'500'});if(start.value)q.set('start_date',start.value);if(end.value)q.set('end_date',end.value);if(kw.value)q.set('keyword',kw.value);const d=await (await fetch('/admin/api/roulette/history?'+q)).json();summary.textContent=`${d.summary?.count||0}건 / 총 ${(d.summary?.total_amount||0).toLocaleString()}원`;rows.innerHTML=(d.rows||[]).map(r=>`<tr><td>${r.id}</td><td>${r.spin_date||''}</td><td>${r.rider_name||''}</td><td>${r.phone||''}</td><td>${r.today_completed||0}</td><td>${r.spin_index||0}</td><td>${r.segment_value||0}</td><td><input id="a${r.id}" type="number" value="${r.reward_amount||0}" style="width:90px;padding:6px"></td><td><input id="n${r.id}" value="${r.note||''}" style="width:150px;padding:6px"></td><td><button onclick="upd(${r.id})">수정</button></td><td><button onclick="delr(${r.id})">삭제</button></td></tr>`).join('')||'<tr><td colspan="11" style="padding:15px">내역이 없습니다.</td></tr>';document.querySelectorAll('td,th').forEach(x=>{x.style.padding='9px';x.style.borderBottom='1px solid #eee';x.style.textAlign='center'})}
+    async function upd(id){const d=await (await fetch('/admin/api/roulette/spin/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({spin_id:id,reward_amount:Number(document.getElementById('a'+id).value||0),note:document.getElementById('n'+id).value})})).json();alert(d.ok?'수정 완료':(d.detail||'실패'));if(d.ok)loadHistory()}
+    async function delr(id){if(!confirm('삭제하시겠습니까?'))return;const d=await (await fetch('/admin/api/roulette/spin/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({spin_id:id})})).json();alert(d.ok?'삭제 완료':(d.detail||'실패'));if(d.ok)loadHistory()}
+    loadHistory();
+    </script>
+    """
+    return html_page("룰렛 당첨내역", body)
+
+
+@app.get("/admin/roulette/history.xlsx")
+def admin_roulette_history_xlsx(request: Request, start_date: str = "", end_date: str = "", keyword: str = ""):
+    r = require_admin(request)
+    if r:
+        return r
+    rows = roulette_db.get_history(start_date=start_date or None, end_date=end_date or None, keyword=keyword or "", limit=100000)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "룰렛 당첨내역"
+    headers = ["ID","날짜","시간","기사명","전화번호","당일완료","회차","구간","당첨금","메모"]
+    ws.append(headers)
+    for row in rows:
+        ts = int(row.get("created_at") or 0)
+        tm = kst_from_epoch(ts).strftime("%H:%M:%S") if ts else ""
+        ws.append([row.get("id"),row.get("spin_date"),tm,row.get("rider_name"),row.get("phone"),row.get("today_completed",0),row.get("spin_index",0),row.get("segment_value",0),row.get("reward_amount",0),row.get("note","")])
+    for i,w in enumerate([8,13,11,15,16,11,9,9,12,24],1): ws.column_dimensions[get_column_letter(i)].width=w
+    bio = BytesIO(); wb.save(bio); bio.seek(0)
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="roulette_history.xlsx"'})
+
 
 @app.get("/admin/api/roulette/history")
 def admin_get_roulette_history(
