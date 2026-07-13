@@ -1660,56 +1660,122 @@ def check_get_redirect():
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_help():
-    cycle = get_operational_cycle_bounds()
-    prev_cycle = get_previous_operational_cycle_bounds()
+def admin_help(request: Request):
+    # 공개 도움말 페이지는 폐쇄하고 관리자 설정으로 이동합니다.
+    r = require_admin(request)
+    if r:
+        return r
+    return RedirectResponse("/admin/settings", status_code=303)
 
-    body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; max-width:900px; margin:0 auto;">
-      <h2 style="margin:0 0 6px 0;">관리자</h2>
-      <div style="color:#666; margin-bottom:12px;">
-        이 서버(Render)는 배민 API를 직접 호출하지 않습니다.<br/>
-        PC에서 collector.py가 /ingest 로 데이터를 업로드하면 조회가 됩니다.
-      </div>
 
-      <div style="background:#f7f7f7; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
-        <div><b>Render 설정</b></div>
-        <div>- Settings → Environment → <b>INGEST_TOKEN</b> 등록</div>
-        <div>- Start Command: <span style="font-family: ui-monospace;">uvicorn main:app --host 0.0.0.0 --port $PORT</span></div>
-      </div>
+@app.get("/admin/settings", response_class=HTMLResponse)
+def admin_settings_page(request: Request):
+    r = require_admin(request)
+    if r:
+        return r
 
-      <div style="margin-top:14px; background:#fff8e8; border:1px solid #ffe1a8; border-radius:12px; padding:12px; font-size:14px; line-height:1.6;">
-        <div><b>NMAX 누적 집계</b></div>
-        <div>- 개인조회 화면에 <b>{NMAX_LABEL}</b> 누적 완료건수를 보여줍니다.</div>
-        <div>- 단, PC에서 그 기간({NMAX_START_DATE.isoformat()} ~ 어제) 범위를 <b>한 번이라도</b> 업로드해야 숫자가 뜹니다.</div>
-      </div>
-
-      <div style="margin-top:14px; background:#eef6ff; border:1px solid #cfe3ff; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
-        <div><b>관리 메뉴</b></div>
-        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-          <a href="/dashboard" style="text-decoration:none;color:#111;font-weight:900;">전체 등급 현황</a>
-          <a href="/admin/roulette" style="text-decoration:none;color:#111;font-weight:900;">룰렛 관리</a>
-          <a href="/admin/teams" style="text-decoration:none;color:#111;font-weight:900;">팀 구성 관리</a>
+    body = """
+    <style>
+      .settings-shell{max-width:980px;margin:0 auto;}
+      .settings-card{background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;margin-bottom:14px;}
+      .settings-nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}
+      .settings-nav a,.settings-btn{display:flex;align-items:center;justify-content:center;min-height:44px;padding:10px 12px;border-radius:11px;border:1px solid #ddd;background:#fff;color:#111;text-decoration:none;font-weight:800;box-sizing:border-box;}
+      .settings-btn.primary{background:#111;color:#fff;border-color:#111;cursor:pointer;}
+      .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+      .settings-input{width:100%;box-sizing:border-box;font-size:16px;padding:11px 12px;border:1px solid #ddd;border-radius:10px;}
+      @media(max-width:720px){
+        .settings-card{padding:12px;border-radius:12px;}
+        .settings-nav{grid-template-columns:1fr 1fr;}
+        .settings-grid{grid-template-columns:1fr;}
+        .settings-btn,.settings-nav a{font-size:14px;min-height:46px;}
+      }
+    </style>
+    <div class="settings-shell">
+      <div class="settings-card">
+        <h2 style="margin:0 0 6px;">⚙ 관리자 설정</h2>
+        <div style="color:#666;line-height:1.6;">관리자 로그인 후에만 접근할 수 있습니다.</div>
+        <div class="settings-nav" style="margin-top:14px;">
+          <a href="/dashboard">📊 대시보드</a>
+          <a href="/admin/teams">👥 팀 관리</a>
+          <a href="/admin/roulette">🎯 룰렛 관리</a>
+          <a href="/">👤 개인 조회</a>
+          <a href="/health">🩺 시스템 상태</a>
+          <a href="/admin-logout">🚪 로그아웃</a>
         </div>
       </div>
-      <div style="margin-top:14px; background:#f7fff5; border:1px solid #cfe8c8; border-radius:12px; padding:12px; font-size:14px; line-height:1.7;">
-        <div><b>전체 백업 / 전체 복원</b></div>
-        <div>- 룰렛 확률, 룰렛 당첨 전체내역, 예정플러스, 이전플러스, 스티커, 입사일, 로그인용 뒷4자리, 관리자 비밀번호까지 포함합니다.</div>
-        <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <a href="/admin/backup/export" style="text-decoration:none; color:#111; font-weight:900; padding:10px 12px; border:1px solid #ddd; border-radius:10px; background:#fff;">전체 백업 다운로드</a>
-          <form method="post" action="/admin/backup/import" enctype="multipart/form-data" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0;">
-            <input type="file" name="file" accept=".json" required />
-            <button type="submit" style="padding:10px 12px; border:none; border-radius:10px; background:#111; color:#fff; font-weight:900; cursor:pointer;">전체 백업 업로드 복원</button>
+
+      <div class="settings-grid">
+        <div class="settings-card">
+          <h3 style="margin-top:0;">🔐 관리자 비밀번호 변경</h3>
+          <form method="post" action="/admin/settings/password" style="display:grid;gap:9px;">
+            <input class="settings-input" type="password" name="current_password" placeholder="현재 비밀번호" required>
+            <input class="settings-input" type="password" name="new_password" placeholder="새 비밀번호(4자 이상)" minlength="4" required>
+            <input class="settings-input" type="password" name="confirm_password" placeholder="새 비밀번호 확인" minlength="4" required>
+            <button class="settings-btn primary" type="submit">비밀번호 변경</button>
           </form>
         </div>
+
+        <div class="settings-card">
+          <h3 style="margin-top:0;">💾 전체 백업</h3>
+          <div style="color:#666;line-height:1.6;margin-bottom:12px;">룰렛 규칙·당첨내역, 스티커, 플러스, 입사일, 로그인 뒷자리, 팀 설정을 함께 저장합니다.</div>
+          <a class="settings-btn" href="/admin/backup/export">전체 백업 다운로드</a>
+        </div>
       </div>
 
-      <div style="margin-top:14px;">
-        <a href="/" style="text-decoration:none; color:#111;">← 조회 화면으로</a>
+      <div class="settings-card">
+        <h3 style="margin-top:0;">📂 전체 백업 업로드 복원</h3>
+        <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:11px;color:#9a3412;line-height:1.6;margin-bottom:12px;">
+          기존 운영 데이터를 덮어씁니다. 정확한 전체 백업 ZIP 또는 JSON만 사용하세요.
+        </div>
+        <form method="post" action="/admin/backup/import" enctype="multipart/form-data" onsubmit="return confirm('현재 데이터를 백업 파일 내용으로 복원하시겠습니까?');" style="display:grid;gap:10px;">
+          <input class="settings-input" type="file" name="file" accept=".zip,.json" required>
+          <button class="settings-btn primary" type="submit">전체 백업 업로드 복원</button>
+        </form>
+      </div>
+
+      <div class="settings-card">
+        <h3 style="margin-top:0;">📄 시스템 안내</h3>
+        <div style="color:#666;line-height:1.7;">
+          PC의 collector.py가 배민 데이터를 수집하여 Render로 업로드합니다.<br>
+          자동 백업은 <b>/backup/export</b>를 토큰 인증으로 호출합니다.<br>
+          운영 데이터는 Render 영구 디스크 경로에 저장해야 배포 후에도 유지됩니다.
+        </div>
       </div>
     </div>
     """
-    return html_page("관리자", body)
+    return HTMLResponse(html_page("관리자 설정", body))
+
+
+@app.post("/admin/settings/password")
+def admin_settings_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+):
+    r = require_admin(request)
+    if r:
+        return r
+    if current_password != get_admin_password():
+        raise HTTPException(status_code=400, detail="현재 관리자 비밀번호가 올바르지 않습니다.")
+    if len(new_password or "") < 4:
+        raise HTTPException(status_code=400, detail="새 비밀번호는 4자 이상이어야 합니다.")
+    if new_password != confirm_password:
+        raise HTTPException(status_code=400, detail="새 비밀번호 확인이 일치하지 않습니다.")
+
+    settings = load_admin_settings()
+    settings["ADMIN_PASSWORD"] = new_password
+    save_admin_settings(settings)
+    request.session["is_admin"] = True
+
+    body = """
+    <div style="background:#fff;border:1px solid #e8e8e8;border-radius:16px;padding:16px;max-width:620px;margin:0 auto;">
+      <h3 style="margin-top:0;">관리자 비밀번호 변경 완료</h3>
+      <div style="color:#666;">새 비밀번호가 저장되었습니다.</div>
+      <div style="margin-top:12px;"><a href="/admin/settings" style="text-decoration:none;color:#111;font-weight:800;">관리자 설정으로 돌아가기</a></div>
+    </div>
+    """
+    return HTMLResponse(html_page("비밀번호 변경 완료", body))
 
 
 @app.post("/attendance-check")
@@ -3351,7 +3417,7 @@ def dashboard(request: Request, q: str = ""):
 
         <div class="dashboard-nav" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <a href="/admin/roulette" style="text-decoration:none; color:#111; font-weight:900;">룰렛 관리</a>
-            <a href="/admin" style="text-decoration:none; color:#111;">관리자 도움말·전체 백업</a>
+            <a href="/admin/settings" style="text-decoration:none; color:#111; font-weight:900;">관리자 설정</a>
             <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
             <a href="/admin/teams" style="text-decoration:none; color:#111; font-weight:900;">팀 구성 관리</a>
         <a href="/admin/team-sets" style="text-decoration:none; color:#111; font-weight:900;">팀 세트 관리</a>
@@ -4357,7 +4423,7 @@ async def admin_backup_import_any(request: Request, file: UploadFile = File(...)
             "<div style='margin-top:12px;'>"
             "<a href='/admin/roulette' style='text-decoration:none;color:#111;'>룰렛 관리자 확인</a>"
             "&nbsp; | &nbsp;"
-            "<a href='/dashboard' style='text-decoration:none;color:#111;'>대시보드 확인</a>"
+            "<a href='/admin/settings' style='text-decoration:none;color:#111;'>관리자 설정</a>"
             "&nbsp; | &nbsp;"
             "<a href='/health' style='text-decoration:none;color:#111;'>Health 확인</a>"
             "</div></div>"
@@ -4785,7 +4851,7 @@ async def _final_admin_backup_import(request: Request, file: UploadFile = File(.
             "<div style='margin-top:12px;'>"
             "<a href='/admin/roulette' style='text-decoration:none;color:#111;'>룰렛 관리자 확인</a>"
             "&nbsp; | &nbsp;"
-            "<a href='/dashboard' style='text-decoration:none;color:#111;'>대시보드 확인</a>"
+            "<a href='/admin/settings' style='text-decoration:none;color:#111;'>관리자 설정</a>"
             "&nbsp; | &nbsp;"
             "<a href='/health' style='text-decoration:none;color:#111;'>Health 확인</a>"
             "</div></div>"
