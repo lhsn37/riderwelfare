@@ -1843,20 +1843,6 @@ def check(
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
 
-    # 성능 개선: 큰 상태 파일은 관리자 페이지 요청당 한 번만 읽습니다.
-    dashboard_status_store = _read_json(STATUS_STORE, {}) or {}
-    def dashboard_complete_map(from_d: date, to_d: date) -> Dict[str, int]:
-        key = f"{from_d.isoformat()}_{to_d.isoformat()}"
-        raw = dashboard_status_store.get(key) or {}
-        m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
-        out_map: Dict[str, int] = {}
-        if isinstance(m, dict):
-            for k, v in m.items():
-                try:
-                    out_map[str(k)] = int(v)
-                except Exception:
-                    pass
-        return out_map
     today_info = today_stats_map.get(api_key) or {
         "complete": 0,
         "reject": 0,
@@ -2900,6 +2886,22 @@ def dashboard(request: Request, q: str = ""):
     today = operation_date()
     ds = fetch_delivery_status_cached()
     today_stats_map = build_today_stats_map(ds)
+
+    # 성능 개선: 큰 상태 파일은 관리자 페이지 요청당 한 번만 읽습니다.
+    dashboard_status_store = _read_json(STATUS_STORE, {}) or {}
+
+    def dashboard_complete_map(from_d: date, to_d: date) -> Dict[str, int]:
+        key = f"{from_d.isoformat()}_{to_d.isoformat()}"
+        raw = dashboard_status_store.get(key) or {}
+        m = raw.get("completeMap") if isinstance(raw, dict) and isinstance(raw.get("completeMap"), dict) else raw
+        out_map: Dict[str, int] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                try:
+                    out_map[str(k)] = int(v)
+                except Exception:
+                    pass
+        return out_map
 
     cur_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
     prev_group: Dict[Tuple[date, date], List[Dict[str, Any]]] = {}
