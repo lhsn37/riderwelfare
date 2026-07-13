@@ -207,11 +207,41 @@ def html_page(title: str, body: str) -> str:
 <html lang="ko">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>{title}</title>
+  <style>
+    * {{ box-sizing:border-box; }}
+    html {{ -webkit-text-size-adjust:100%; }}
+    body {{
+      margin:0; padding:16px; background:#f6f7f9; color:#111;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',sans-serif;
+      overflow-wrap:anywhere;
+    }}
+    input, select, textarea, button {{ font:inherit; max-width:100%; }}
+    input, select, textarea {{ min-height:44px; }}
+    button, a {{ -webkit-tap-highlight-color:transparent; }}
+    button {{ min-height:42px; cursor:pointer; }}
+    table {{ max-width:100%; }}
+    .page-shell {{ max-width:1400px; margin:0 auto; }}
+    .mobile-scroll {{ overflow-x:auto; -webkit-overflow-scrolling:touch; }}
+    @media (max-width:768px) {{
+      body {{ padding:10px; }}
+      .page-shell {{ width:100%; }}
+      h1 {{ font-size:24px !important; }}
+      h2 {{ font-size:21px !important; line-height:1.3; }}
+      h3 {{ font-size:18px !important; }}
+      form {{ max-width:100%; }}
+      input:not([type=checkbox]):not([type=radio]), select, textarea {{
+        width:100% !important; font-size:16px !important;
+      }}
+      button {{ min-height:44px; padding:10px 13px !important; }}
+      a {{ line-height:1.35; }}
+      table {{ font-size:13px; }}
+    }}
+  </style>
 </head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; padding:16px; background:#fafafa;">
-  <div style="max-width:1400px; margin:0 auto;">
+<body>
+  <div class="page-shell">
     {body}
   </div>
 </body>
@@ -3205,8 +3235,64 @@ def dashboard(request: Request, q: str = ""):
     cycle = get_previous_operational_cycle_bounds()
 
     body = f"""
-    <div style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
-      <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+    <style>
+      .dashboard-card {{ background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px; }}
+      .dashboard-nav a {{
+        display:inline-flex; align-items:center; justify-content:center;
+        min-height:40px; padding:8px 11px; border:1px solid #e5e7eb;
+        border-radius:10px; background:#fff; text-decoration:none !important;
+      }}
+      .dashboard-table-wrap {{ margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px; }}
+      @media (max-width:768px) {{
+        .dashboard-card {{ padding:12px; border-radius:14px; }}
+        .dashboard-header {{ display:block !important; }}
+        .dashboard-nav {{ display:grid !important; grid-template-columns:1fr 1fr; gap:8px !important; margin-top:12px; }}
+        .dashboard-nav a {{ width:100%; min-height:44px; text-align:center; font-size:14px; }}
+        .dashboard-search {{ display:grid !important; grid-template-columns:1fr; gap:8px !important; flex-basis:100% !important; }}
+        .dashboard-search button {{ width:100%; }}
+        .dashboard-table-wrap {{ overflow:visible; border:0; background:transparent; }}
+        .dashboard-table {{ min-width:0 !important; display:block; }}
+        .dashboard-table thead {{ display:none; }}
+        .dashboard-table tbody {{ display:grid; gap:12px; }}
+        .dashboard-table tr.bulk-row {{
+          display:block; background:#fff; border:1px solid #e5e7eb;
+          border-radius:14px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,.04);
+        }}
+        .dashboard-table tr.bulk-row td {{
+          display:grid; grid-template-columns:112px minmax(0,1fr);
+          gap:10px; align-items:start; width:100% !important; min-width:0 !important;
+          padding:10px 4px !important; border-bottom:1px solid #f0f0f0 !important;
+          text-align:left !important;
+        }}
+        .dashboard-table tr.bulk-row td:last-child {{ border-bottom:0 !important; }}
+        .dashboard-table tr.bulk-row td::before {{ font-size:12px; font-weight:800; color:#6b7280; line-height:1.5; }}
+        .dashboard-table tr.bulk-row td:nth-child(1)::before {{ content:'순번'; }}
+        .dashboard-table tr.bulk-row td:nth-child(2)::before {{ content:'기사 / 오늘비율'; }}
+        .dashboard-table tr.bulk-row td:nth-child(3)::before {{ content:'로그인 설정'; }}
+        .dashboard-table tr.bulk-row td:nth-child(4)::before {{ content:'배민 입사일'; }}
+        .dashboard-table tr.bulk-row td:nth-child(5)::before {{ content:'기준일'; }}
+        .dashboard-table tr.bulk-row td:nth-child(6)::before {{ content:'평가기간'; }}
+        .dashboard-table tr.bulk-row td:nth-child(7)::before {{ content:'오늘 운행'; }}
+        .dashboard-table tr.bulk-row td:nth-child(8)::before {{ content:'현재 완료'; }}
+        .dashboard-table tr.bulk-row td:nth-child(9)::before {{ content:'현재 등급'; }}
+        .dashboard-table tr.bulk-row td:nth-child(10)::before {{ content:'예정 등급'; }}
+        .dashboard-table tr.bulk-row td:nth-child(11)::before {{ content:'다음 등급'; }}
+        .dashboard-table tr.bulk-row td:nth-child(12)::before {{ content:'남은 건수'; }}
+        .dashboard-table tr.bulk-row td:nth-child(13)::before {{ content:'이전 플러스'; }}
+        .dashboard-table tr.bulk-row td:nth-child(14)::before {{ content:'예정 플러스'; }}
+        .dashboard-table tr.bulk-row td form {{ width:100%; }}
+        .dashboard-table tr.bulk-row td form[style*="display:flex"] {{ display:grid !important; grid-template-columns:1fr auto; gap:6px !important; }}
+        .dashboard-table tr.bulk-row td input:not([type=checkbox]) {{ width:100% !important; }}
+        .dashboard-table tr.bulk-row td button {{ white-space:nowrap; }}
+        #bulkSaveResult {{ display:block; width:100%; margin-top:4px; }}
+      }}
+      @media (max-width:420px) {{
+        .dashboard-nav {{ grid-template-columns:1fr; }}
+        .dashboard-table tr.bulk-row td {{ grid-template-columns:96px minmax(0,1fr); gap:8px; }}
+      }}
+    </style>
+    <div class="dashboard-card" style="background:#fff; border:1px solid #e8e8e8; border-radius:16px; padding:16px;">
+      <div class="dashboard-header" style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
         <div>
           <h2 style="margin:0 0 6px 0;">전체 등급 현황</h2>
           <div style="color:#666; line-height:1.6;">
@@ -3220,7 +3306,7 @@ def dashboard(request: Request, q: str = ""):
           </div>
         </div>
 
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div class="dashboard-nav" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <a href="/admin/roulette" style="text-decoration:none; color:#111; font-weight:900;">룰렛 관리</a>
             <a href="/admin" style="text-decoration:none; color:#111;">관리자 도움말·전체 백업</a>
             <a href="/" style="text-decoration:none; color:#111;">개인 조회</a>
@@ -3232,7 +3318,7 @@ def dashboard(request: Request, q: str = ""):
 
 
       <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
-        <form method="get" action="/dashboard" style="display:flex; gap:8px; flex:1 1 480px;">
+        <form class="dashboard-search" method="get" action="/dashboard" style="display:flex; gap:8px; flex:1 1 480px;">
           <input name="q" value="{q}"
                  placeholder="이름 또는 배민뒷4 검색 (예: 이정 / 1898)"
                  style="flex:1; font-size:16px; padding:10px 12px; border:1px solid #ddd; border-radius:12px;" />
@@ -3291,8 +3377,8 @@ def dashboard(request: Request, q: str = ""):
       }}
       </script>
 
-      <div style="margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px;">
-        <table style="border-collapse:collapse; width:100%; min-width:2350px;">
+      <div class="dashboard-table-wrap" style="margin-top:14px; overflow:auto; border:1px solid #eee; border-radius:12px;">
+        <table class="dashboard-table" style="border-collapse:collapse; width:100%; min-width:2350px;">
           <thead>
             <tr style="background:#fafafa;">
               <th style="padding:10px; border-bottom:1px solid #eee; text-align:right; color:#999;">#</th>
