@@ -317,10 +317,6 @@ def main_loop():
     print(f"[collector] CENTER_ID={CENTER_ID}")
     print(f"[collector] RENDER_BASE={RENDER_BASE}")
 
-    # 프로세스가 시작될 때 전날 팀 기록을 한 번 강제로 재수집합니다.
-    # 서버에 잘못된/오래된 하루 기록이 남아 ranges 요청이 안 오는 경우를 복구합니다.
-    forced_team_history_done = set()
-
     while True:
         try:
             with sync_playwright() as p:
@@ -350,28 +346,6 @@ def main_loop():
                 ds_j = validate_delivery_status_for_ingest(fetch_delivery_status(page))
                 ds_result = post_json("/ingest/delivery-status", {"data": ds_j})
                 print(f"[collector] delivery-status accepted={ds_result.get('count', '-')}")
-
-                # 1.7) 전날 팀 과거기록 강제 갱신(프로세스 시작 후 날짜별 1회)
-                yesterday = today_kst() - timedelta(days=1)
-                yesterday_s = yesterday.isoformat()
-                if yesterday_s not in forced_team_history_done:
-                    cm_force, hm_force = fetch_status_range(page, yesterday_s, yesterday_s)
-                    if len(hm_force) < MIN_DELIVERY_STATUS_COUNT:
-                        raise RuntimeError(
-                            f"TEAM_HISTORY_SAFETY_BLOCK date={yesterday_s} riders={len(hm_force)}"
-                        )
-                    post_json(
-                        "/ingest/status",
-                        {
-                            "fromDate": yesterday_s,
-                            "toDate": yesterday_s,
-                            "kind": "team_history",
-                            "completeMap": cm_force,
-                            "historyMap": hm_force,
-                        },
-                    )
-                    forced_team_history_done.add(yesterday_s)
-                    print(f"[collector] forced team_history saved {yesterday_s} riders={len(hm_force)}")
 
                 # 2) ranges
                 ranges_resp = get_ranges()

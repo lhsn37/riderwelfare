@@ -1551,11 +1551,7 @@ def ingest_ranges(request: Request):
     team_rows = [x for x in out if x.get("kind") == "team_history"]
     status_rows.sort(key=lambda x: (str(x.get("toDate") or ""), str(x.get("fromDate") or "")), reverse=True)
     team_rows.sort(key=lambda x: str(x.get("fromDate") or ""), reverse=True)
-    # 최근 팀 하루기록을 먼저 내려보내 팀 페이지를 우선 복구합니다.
-    recent_cutoff = operation_date() - timedelta(days=7)
-    recent_team_rows = [x for x in team_rows if safe_date_parse(str(x.get("fromDate") or "")) and safe_date_parse(str(x.get("fromDate") or "")) >= recent_cutoff]
-    older_team_rows = [x for x in team_rows if x not in recent_team_rows]
-    out = recent_team_rows + status_rows + older_team_rows
+    out = status_rows + team_rows
     return {"ok": True, "ranges": out, "count": len(out)}
 
 
@@ -5171,29 +5167,12 @@ def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, i
         api_key = f"{norm_name(name)}|{real4}" if name and real4 else ""
         history = fetch_status_history_map(op_day, op_day)
         rec = history.get(api_key) if api_key else None
-        # 전화번호 뒷자리 변경/팀 로그인키 변경으로 정확한 키가 맞지 않는 경우
-        # 같은 이름의 과거 API 기록을 보조 매칭합니다.
-        if not isinstance(rec, dict) and name:
-            target_name = norm_name(name)
-            name_matches = [
-                value for value in history.values()
-                if isinstance(value, dict) and norm_name(value.get("name") or "") == target_name
-            ]
-            if len(name_matches) == 1:
-                rec = name_matches[0]
         if isinstance(rec, dict):
             peak = rec.get("peak") or {}
             out["morning_lunch"]["complete"] = int(peak.get("morning") or 0)
             out["afternoon_offpeak"]["complete"] = int(peak.get("afternoon") or 0)
             out["dinner_peak"]["complete"] = int(peak.get("evening") or 0)
             out["late_night"]["complete"] = int(peak.get("midnight") or 0)
-
-            # 배민 과거 API가 일일 완료만 주고 구간값을 0으로 주는 경우가 있습니다.
-            # 이때도 팀 합계가 0이 되지 않도록 일일 완료를 첫 구간에 보존합니다.
-            daily_complete = int(rec.get("complete") or 0)
-            period_sum = sum(int(out[p].get("complete") or 0) for p in TEAM_PERIODS)
-            if daily_complete > 0 and period_sum == 0:
-                out["morning_lunch"]["complete"] = daily_complete
             out["_meta"] = {  # type: ignore[assignment]
                 "historical_api": 1,
                 "daily_reject": int(rec.get("reject") or 0),
