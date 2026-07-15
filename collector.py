@@ -358,14 +358,27 @@ def main_loop():
                 for rg in ranges:
                     fd = str(rg.get("fromDate") or "")
                     td = str(rg.get("toDate") or "")
-                    key = f"{fd}_{td}"
+                    kind = str(rg.get("kind") or "status")
+                    key = f"{kind}:{fd}_{td}"
                     if not fd or not td or key in seen_ranges:
                         continue
                     seen_ranges.add(key)
                     unique_ranges.append({
                         "fromDate": fd, "toDate": td,
-                        "kind": str(rg.get("kind") or "status"),
+                        "kind": kind,
                     })
+
+                # 서버 순서를 따르되 최근 팀 하루 기록을 최우선으로 한 번 더 정렬합니다.
+                today_text = today_kst().isoformat()
+                unique_ranges.sort(key=lambda x: (
+                    0 if x.get("kind") == "team_history" and x.get("toDate", "") >= (today_kst() - timedelta(days=7)).isoformat() else
+                    1 if x.get("kind") != "team_history" else 2,
+                    x.get("toDate", ""),
+                ))
+                recent_team = [x for x in unique_ranges if x.get("kind") == "team_history" and x.get("toDate", "") >= (today_kst() - timedelta(days=7)).isoformat()]
+                recent_team.sort(key=lambda x: x.get("toDate", ""), reverse=True)
+                others = [x for x in unique_ranges if x not in recent_team]
+                unique_ranges = recent_team + others
 
                 if unique_ranges:
                     print(f"[collector] missing history ranges={len(unique_ranges)}")

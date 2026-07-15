@@ -1541,17 +1541,17 @@ def ingest_ranges(request: Request):
         if not is_saved:
             out.append({"fromDate": from_d, "toDate": to_d, "kind": "team_history" if require_history else "status"})
 
-    # 등급용 최신 범위를 먼저 내려보내 화면 복구를 우선합니다.
-    out.sort(key=lambda x: (
-        1 if x.get("kind") == "team_history" else 0,
-        str(x.get("toDate") or ""),
-        str(x.get("fromDate") or ""),
-    ), reverse=False)
+    # 팀 페이지에서 어제 기록이 0으로 보이지 않도록 최근 하루 기록을 최우선 수집합니다.
+    # 그 다음 등급용 최신 범위, 마지막으로 오래된 팀 기록을 백필합니다.
     status_rows = [x for x in out if x.get("kind") != "team_history"]
     team_rows = [x for x in out if x.get("kind") == "team_history"]
     status_rows.sort(key=lambda x: (str(x.get("toDate") or ""), str(x.get("fromDate") or "")), reverse=True)
     team_rows.sort(key=lambda x: str(x.get("fromDate") or ""), reverse=True)
-    out = status_rows + team_rows
+
+    recent_cutoff = (operation_date() - timedelta(days=7)).isoformat()
+    recent_team_rows = [x for x in team_rows if str(x.get("fromDate") or "") >= recent_cutoff]
+    older_team_rows = [x for x in team_rows if str(x.get("fromDate") or "") < recent_cutoff]
+    out = recent_team_rows + status_rows + older_team_rows
     return {"ok": True, "ranges": out, "count": len(out)}
 
 
@@ -5155,6 +5155,62 @@ def capture_team_snapshot(delivery_data: Dict[str, Any] | None = None) -> None:
         print("TEAM SNAPSHOT ERROR:", e)
 
 
+def _history_complete_by_period(rec: Dict[str, Any], op_day: date) -> Tuple[Dict[str, int], bool]:
+    """과거 API 기록을 팀 4구간으로 변환합니다.
+
+    배민 응답의 peak 값이 비어 있거나 일일 완료와 맞지 않는 경우 hourlyCompleted를
+    우선 사용하고, 그래도 구간 분리가 불가능하면 일일 총합을 보존합니다.
+    반환값의 bool은 '일일 총합만 표시해야 함' 여부입니다.
+    """
+    daily_complete = max(0, int(rec.get("complete") or 0))
+    result = {p: 0 for p in TEAM_PERIODS}
+
+    hourly = rec.get("hourlyCompleted") or []
+    hourly_sum = 0
+    if isinstance(hourly, list):
+        for item in hourly:
+            if not isinstance(item, dict):
+                continue
+            hour = int(item.get("hour") or 0) % 24
+            count = max(0, int(item.get("count") or 0))
+            hourly_sum += count
+            if hour >= 20 or hour < 6:
+                period = "late_night"
+            elif op_day.weekday() in (5, 6):
+                period = "morning_lunch" if hour < 14 else ("afternoon_offpeak" if hour < 17 else "dinner_peak")
+            else:
+                period = "morning_lunch" if hour < 13 else ("afternoon_offpeak" if hour < 17 else "dinner_peak")
+            result[period] += count
+
+    # 시간대 기록이 있으면 실제 일일 총합과 맞도록 차이를 보정합니다.
+    if hourly_sum > 0:
+        diff = daily_complete - sum(result.values())
+        if diff > 0:
+            result["morning_lunch"] += diff
+        elif diff < 0 and daily_complete >= 0:
+            # API가 누적값 형태로 내려온 예외 응답이면 시간대 합계를 쓰지 않습니다.
+            result = {p: 0 for p in TEAM_PERIODS}
+        else:
+            return result, False
+        if sum(result.values()) == daily_complete:
+            return result, False
+
+    peak = rec.get("peak") or {}
+    peak_result = {
+        "morning_lunch": max(0, int(peak.get("morning") or 0)),
+        "afternoon_offpeak": max(0, int(peak.get("afternoon") or 0)),
+        "dinner_peak": max(0, int(peak.get("evening") or 0)),
+        "late_night": max(0, int(peak.get("midnight") or 0)),
+    }
+    if sum(peak_result.values()) == daily_complete and daily_complete > 0:
+        return peak_result, False
+
+    # 구간값이 비어 있어도 일일 완료를 0으로 만들지 않습니다.
+    result = {p: 0 for p in TEAM_PERIODS}
+    result["morning_lunch"] = daily_complete
+    return result, True
+
+
 def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, int]]:
     out = {p: {"complete": 0, "reject": 0, "cancel": 0} for p in TEAM_PERIODS}
 
@@ -5168,13 +5224,12 @@ def team_member_day_stats(login_key: str, op_day: date) -> Dict[str, Dict[str, i
         history = fetch_status_history_map(op_day, op_day)
         rec = history.get(api_key) if api_key else None
         if isinstance(rec, dict):
-            peak = rec.get("peak") or {}
-            out["morning_lunch"]["complete"] = int(peak.get("morning") or 0)
-            out["afternoon_offpeak"]["complete"] = int(peak.get("afternoon") or 0)
-            out["dinner_peak"]["complete"] = int(peak.get("evening") or 0)
-            out["late_night"]["complete"] = int(peak.get("midnight") or 0)
+            period_complete, daily_only = _history_complete_by_period(rec, op_day)
+            for period in TEAM_PERIODS:
+                out[period]["complete"] = int(period_complete.get(period) or 0)
             out["_meta"] = {  # type: ignore[assignment]
                 "historical_api": 1,
+                "historical_daily": 1 if daily_only else 0,
                 "daily_reject": int(rec.get("reject") or 0),
                 "daily_cancel": int(rec.get("cancel") or 0),
                 "daily_complete": int(rec.get("complete") or 0),
