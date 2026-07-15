@@ -1124,6 +1124,79 @@ def get_admin_password() -> str:
     return pw or ADMIN_PASSWORD
 
 
+
+def _export_roulette_settings_snapshot() -> Dict[str, Any]:
+    """룰렛 확률/규칙을 당첨내역과 별도로 확실하게 백업합니다."""
+    return {
+        "enabled": bool(roulette_db.get_enabled()),
+        "spin_unit": int(roulette_db.get_spin_unit()),
+        "max_segment_value": int(roulette_db.get_max_segment_value()),
+        "segment_rewards": roulette_db.get_all_segment_rewards(),
+    }
+
+
+def _extract_roulette_settings_snapshot(payload: Any) -> Dict[str, Any]:
+    """신형·구형 룰렛 백업 형식에서 설정값을 최대한 찾아냅니다."""
+    if not isinstance(payload, dict):
+        return {}
+
+    candidates = [payload]
+    for key in ("roulette_settings_v2", "roulette_settings", "settings", "config", "roulette"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    result: Dict[str, Any] = {}
+    for item in candidates:
+        if "enabled" in item and "enabled" not in result:
+            result["enabled"] = bool(item.get("enabled"))
+        if "spin_unit" in item and "spin_unit" not in result:
+            result["spin_unit"] = int(item.get("spin_unit") or 10)
+        if "max_segment_value" in item and "max_segment_value" not in result:
+            result["max_segment_value"] = int(item.get("max_segment_value") or 100)
+
+        rewards = None
+        for key in ("segment_rewards", "segments", "rewards", "probabilities"):
+            value = item.get(key)
+            if isinstance(value, list):
+                rewards = value
+                break
+        if rewards is not None and "segment_rewards" not in result:
+            result["segment_rewards"] = rewards
+
+    return result
+
+
+def _apply_roulette_settings_snapshot(snapshot: Any) -> Dict[str, Any]:
+    """import_json 결과와 무관하게 룰렛 규칙·확률을 setter로 강제 복원합니다."""
+    settings = _extract_roulette_settings_snapshot(snapshot)
+    applied = []
+
+    if "enabled" in settings:
+        roulette_db.set_enabled(bool(settings["enabled"]))
+        applied.append("enabled")
+
+    if "spin_unit" in settings:
+        roulette_db.set_spin_unit(max(1, int(settings["spin_unit"])))
+        applied.append("spin_unit")
+
+    if "max_segment_value" in settings:
+        roulette_db.set_max_segment_value(max(1, int(settings["max_segment_value"])))
+        applied.append("max_segment_value")
+
+    rewards = settings.get("segment_rewards")
+    if isinstance(rewards, list) and len(rewards) > 0:
+        roulette_db.set_segment_rewards(rewards)
+        applied.append(f"segment_rewards:{len(rewards)}")
+
+    return {
+        "ok": True,
+        "applied": applied,
+        "segment_rows": len(rewards) if isinstance(rewards, list) else 0,
+    }
+
+
+
 def get_backup_payload() -> Dict[str, Any]:
     files = {}
     paths = [
@@ -1165,6 +1238,8 @@ def get_backup_payload() -> Dict[str, Any]:
         },
         "files": files,
         "roulette": roulette_payload,
+        # import_json 구현이 설정 일부를 건너뛰더라도 복원할 수 있도록 별도 보관
+        "roulette_settings_v2": _export_roulette_settings_snapshot(),
     }
 
 
@@ -1220,11 +1295,29 @@ def restore_backup_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     roulette_result = None
     roulette_payload = payload.get("roulette")
-    if isinstance(roulette_payload, dict) and "_backup_error" not in roulette_payload:
-        try:
-            roulette_result = roulette_db.import_json(roulette_payload)
-        except Exception as e:
-            roulette_result = {"ok": False, "error": str(e)}
+    roulette_settings_payload = payload.get("roulette_settings_v2")
+
+    try:
+        import_result = None
+        if isinstance(roulette_payload, dict) and "_backup_error" not in roulette_payload:
+            import_result = roulette_db.import_json(roulette_payload)
+
+        # 신형 백업은 별도 설정 스냅샷을 사용하고,
+        # 구형 백업은 roulette export 내부에서 설정을 추출합니다.
+        settings_source = (
+            roulette_settings_payload
+            if isinstance(roulette_settings_payload, dict)
+            else roulette_payload
+        )
+        settings_result = _apply_roulette_settings_snapshot(settings_source)
+
+        roulette_result = {
+            "ok": True,
+            "import_result": import_result,
+            "settings_result": settings_result,
+        }
+    except Exception as e:
+        roulette_result = {"ok": False, "error": str(e)}
 
     _riders_cache["ts"] = 0.0
     _riders_cache["data"] = None
@@ -4731,7 +4824,7 @@ def _final_restore_backup_bytes(data: bytes):
                 try:
                     loaded = json.loads(raw.decode("utf-8-sig"))
                     if isinstance(loaded, dict):
-                        if "spins" in loaded or "settings" in loaded or "segments" in loaded:
+                        if ("spins" in loaded or "settings" in loaded or "segments" in loaded or "segment_rewards" in loaded or "spin_unit" in loaded):
                             roulette_payload = loaded
                         elif isinstance(loaded.get("roulette"), dict):
                             roulette_payload = loaded.get("roulette")
@@ -4753,7 +4846,13 @@ def _final_restore_backup_bytes(data: bytes):
 
     try:
         if isinstance(roulette_payload, dict):
-            roulette_result = roulette_db.import_json(roulette_payload)
+            import_result = roulette_db.import_json(roulette_payload)
+            settings_result = _apply_roulette_settings_snapshot(roulette_payload)
+            roulette_result = {
+                "ok": True,
+                "import_result": import_result,
+                "settings_result": settings_result,
+            }
         elif isinstance(roulette_spins, list):
             try:
                 current = roulette_db.export_json()
