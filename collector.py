@@ -317,6 +317,10 @@ def main_loop():
     print(f"[collector] CENTER_ID={CENTER_ID}")
     print(f"[collector] RENDER_BASE={RENDER_BASE}")
 
+    # 프로세스가 시작될 때 전날 팀 기록을 한 번 강제로 재수집합니다.
+    # 서버에 잘못된/오래된 하루 기록이 남아 ranges 요청이 안 오는 경우를 복구합니다.
+    forced_team_history_done = set()
+
     while True:
         try:
             with sync_playwright() as p:
@@ -347,6 +351,28 @@ def main_loop():
                 ds_result = post_json("/ingest/delivery-status", {"data": ds_j})
                 print(f"[collector] delivery-status accepted={ds_result.get('count', '-')}")
 
+                # 1.7) 전날 팀 과거기록 강제 갱신(프로세스 시작 후 날짜별 1회)
+                yesterday = today_kst() - timedelta(days=1)
+                yesterday_s = yesterday.isoformat()
+                if yesterday_s not in forced_team_history_done:
+                    cm_force, hm_force = fetch_status_range(page, yesterday_s, yesterday_s)
+                    if len(hm_force) < MIN_DELIVERY_STATUS_COUNT:
+                        raise RuntimeError(
+                            f"TEAM_HISTORY_SAFETY_BLOCK date={yesterday_s} riders={len(hm_force)}"
+                        )
+                    post_json(
+                        "/ingest/status",
+                        {
+                            "fromDate": yesterday_s,
+                            "toDate": yesterday_s,
+                            "kind": "team_history",
+                            "completeMap": cm_force,
+                            "historyMap": hm_force,
+                        },
+                    )
+                    forced_team_history_done.add(yesterday_s)
+                    print(f"[collector] forced team_history saved {yesterday_s} riders={len(hm_force)}")
+
                 # 2) ranges
                 ranges_resp = get_ranges()
                 ranges = list(ranges_resp.get("ranges") or []) if ranges_resp.get("ok") else []
@@ -358,27 +384,14 @@ def main_loop():
                 for rg in ranges:
                     fd = str(rg.get("fromDate") or "")
                     td = str(rg.get("toDate") or "")
-                    kind = str(rg.get("kind") or "status")
-                    key = f"{kind}:{fd}_{td}"
+                    key = f"{fd}_{td}"
                     if not fd or not td or key in seen_ranges:
                         continue
                     seen_ranges.add(key)
                     unique_ranges.append({
                         "fromDate": fd, "toDate": td,
-                        "kind": kind,
+                        "kind": str(rg.get("kind") or "status"),
                     })
-
-                # 서버 순서를 따르되 최근 팀 하루 기록을 최우선으로 한 번 더 정렬합니다.
-                today_text = today_kst().isoformat()
-                unique_ranges.sort(key=lambda x: (
-                    0 if x.get("kind") == "team_history" and x.get("toDate", "") >= (today_kst() - timedelta(days=7)).isoformat() else
-                    1 if x.get("kind") != "team_history" else 2,
-                    x.get("toDate", ""),
-                ))
-                recent_team = [x for x in unique_ranges if x.get("kind") == "team_history" and x.get("toDate", "") >= (today_kst() - timedelta(days=7)).isoformat()]
-                recent_team.sort(key=lambda x: x.get("toDate", ""), reverse=True)
-                others = [x for x in unique_ranges if x not in recent_team]
-                unique_ranges = recent_team + others
 
                 if unique_ranges:
                     print(f"[collector] missing history ranges={len(unique_ranges)}")
