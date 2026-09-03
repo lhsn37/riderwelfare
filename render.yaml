@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: riderwelfare
+    runtime: python
+    buildCommand: pip install -r control_server/requirements.txt
+    startCommand: uvicorn control_server.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CONTROL_TOKEN
+        sync: false
